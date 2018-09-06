@@ -1,3 +1,7 @@
+// Copyright (c) 2014 The sortutil Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSES/STRUTIL-LICENSE file.
+
 // Copyright 2015 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +18,7 @@
 package format
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 )
@@ -36,6 +41,13 @@ type indentFormatter struct {
 	indent      []byte
 	indentLevel int
 	state       int
+}
+
+var replace = map[rune]string{
+	'\000': "\\0",
+	'\'':   "''",
+	'\n':   "\\n",
+	'\r':   "\\r",
 }
 
 // IndentFormatter returns a new Formatter which interprets %i and %u in the
@@ -63,7 +75,7 @@ func IndentFormatter(w io.Writer, indent string) Formatter {
 }
 
 func (f *indentFormatter) format(flat bool, format string, args ...interface{}) (n int, errno error) {
-	buf := []byte{}
+	var buf = make([]byte, 0)
 	for i := 0; i < len(format); i++ {
 		c := format[i]
 		switch f.state {
@@ -166,4 +178,18 @@ func FlatFormatter(w io.Writer) Formatter {
 // Format implements Format interface.
 func (f *flatFormatter) Format(format string, args ...interface{}) (n int, errno error) {
 	return (*indentFormatter)(f).format(true, format, args...)
+}
+
+// OutputFormat output escape character with backslash.
+func OutputFormat(s string) string {
+	var buf bytes.Buffer
+	for _, old := range s {
+		if newVal, ok := replace[old]; ok {
+			buf.WriteString(newVal)
+			continue
+		}
+		buf.WriteRune(old)
+	}
+
+	return buf.String()
 }

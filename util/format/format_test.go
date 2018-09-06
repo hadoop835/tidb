@@ -19,9 +19,11 @@ import (
 	"testing"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -39,6 +41,7 @@ func checkFormat(c *C, f Formatter, buf *bytes.Buffer, str, expect string) {
 }
 
 func (s *testFormatSuite) TestFormat(c *C) {
+	defer testleak.AfterTest(c)()
 	str := "abc%d%%e%i\nx\ny\n%uz\n"
 	buf := &bytes.Buffer{}
 	f := IndentFormatter(buf, "\t")

@@ -13,11 +13,18 @@
 
 package charset
 
+import (
+	"strings"
+
+	"github.com/juju/errors"
+	"github.com/pingcap/tidb/mysql"
+)
+
 // Charset is a charset.
 // Now we only support MySQL.
 type Charset struct {
 	Name             string
-	DefaultCollation *Collation
+	DefaultCollation string
 	Collations       map[string]*Collation
 	Desc             string
 	Maxlen           int
@@ -34,28 +41,13 @@ type Collation struct {
 
 var charsets = make(map[string]*Charset)
 
-// All the supported charsets should in the following table.
+// All the supported charsets should be in the following table.
 var charsetInfos = []*Charset{
-	{"utf8", nil, make(map[string]*Collation), "UTF-8 Unicode", 3},
-	{"latin1", nil, make(map[string]*Collation), "cp1252 West European", 1},
-	{"utf8mb4", nil, make(map[string]*Collation), "UTF-8 Unicode", 4},
-	{"ascii", nil, make(map[string]*Collation), "US ASCII", 1},
-}
-
-func init() {
-	for _, c := range charsetInfos {
-		charsets[c.Name] = c
-	}
-	for _, c := range collations {
-		charset, ok := charsets[c.CharsetName]
-		if !ok {
-			continue
-		}
-		charset.Collations[c.Name] = c
-		if c.IsDefault {
-			charset.DefaultCollation = c
-		}
-	}
+	{CharsetUTF8, CollationUTF8, make(map[string]*Collation), "UTF-8 Unicode", 3},
+	{CharsetUTF8MB4, CollationUTF8MB4, make(map[string]*Collation), "UTF-8 Unicode", 4},
+	{CharsetASCII, CollationASCII, make(map[string]*Collation), "US ASCII", 1},
+	{CharsetLatin1, CollationLatin1, make(map[string]*Collation), "Latin1", 1},
+	{CharsetBin, CollationBin, make(map[string]*Collation), "binary", 1},
 }
 
 // Desc is a charset description.
@@ -77,7 +69,7 @@ func GetAllCharsets() []*Desc {
 		}
 		desc := &Desc{
 			Name:             c.Name,
-			DefaultCollation: c.DefaultCollation.Name,
+			DefaultCollation: c.DefaultCollation,
 			Desc:             c.Desc,
 			Maxlen:           c.Maxlen,
 		}
@@ -87,13 +79,13 @@ func GetAllCharsets() []*Desc {
 }
 
 // ValidCharsetAndCollation checks the charset and the collation validity
-// and retuns a boolean.
+// and returns a boolean.
 func ValidCharsetAndCollation(cs string, co string) bool {
 	// We will use utf8 as a default charset.
 	if cs == "" {
 		cs = "utf8"
 	}
-
+	cs = strings.ToLower(cs)
 	c, ok := charsets[cs]
 	if !ok {
 		return false
@@ -110,9 +102,82 @@ func ValidCharsetAndCollation(cs string, co string) bool {
 	return true
 }
 
+// GetDefaultCollation returns the default collation for charset.
+func GetDefaultCollation(charset string) (string, error) {
+	charset = strings.ToLower(charset)
+	if charset == CharsetBin {
+		return CollationBin, nil
+	}
+	c, ok := charsets[charset]
+	if !ok {
+		return "", errors.Errorf("Unknown charset %s", charset)
+	}
+	return c.DefaultCollation, nil
+}
+
+// GetCharsetInfo returns charset and collation for cs as name.
+func GetCharsetInfo(cs string) (string, string, error) {
+	c, ok := charsets[strings.ToLower(cs)]
+	if !ok {
+		return "", "", errors.Errorf("Unknown charset %s", cs)
+	}
+	return c.Name, c.DefaultCollation, nil
+}
+
+// GetCharsetDesc gets charset descriptions in the local charsets.
+func GetCharsetDesc(cs string) (*Desc, error) {
+	c, ok := charsets[strings.ToLower(cs)]
+	if !ok {
+		return nil, errors.Errorf("Unknown charset %s", cs)
+	}
+	desc := &Desc{
+		Name:             c.Name,
+		DefaultCollation: c.DefaultCollation,
+		Desc:             c.Desc,
+		Maxlen:           c.Maxlen,
+	}
+	return desc, nil
+}
+
+// GetCharsetInfoByID returns charset and collation for id as cs_number.
+func GetCharsetInfoByID(coID int) (string, string, error) {
+	if coID == mysql.DefaultCollationID {
+		return mysql.DefaultCharset, mysql.DefaultCollationName, nil
+	}
+	for _, collation := range collations {
+		if coID == collation.ID {
+			return collation.CharsetName, collation.Name, nil
+		}
+	}
+	return "", "", errors.Errorf("Unknown charset id %d", coID)
+}
+
+// GetCollations returns a list for all collations.
+func GetCollations() []*Collation {
+	return collations
+}
+
 const (
 	// CharsetBin is used for marking binary charset.
 	CharsetBin = "binary"
+	// CollationBin is the default collation for CharsetBin.
+	CollationBin = "binary"
+	// CharsetUTF8 is the default charset for string types.
+	CharsetUTF8 = "utf8"
+	// CollationUTF8 is the default collation for CharsetUTF8.
+	CollationUTF8 = "utf8_bin"
+	// CharsetUTF8MB4 represents 4 bytes utf8, which works the same way as utf8 in Go.
+	CharsetUTF8MB4 = "utf8mb4"
+	// CollationUTF8MB4 is the default collation for CharsetUTF8MB4.
+	CollationUTF8MB4 = "utf8mb4_bin"
+	// CharsetASCII is a subset of UTF8.
+	CharsetASCII = "ascii"
+	// CollationASCII is the default collation for CharsetACSII.
+	CollationASCII = "ascii_bin"
+	// CharsetLatin1 is a single byte charset.
+	CharsetLatin1 = "latin1"
+	// CollationLatin1 is the default collation for CharsetLatin1.
+	CollationLatin1 = "latin1_bin"
 )
 
 var collations = []*Collation{
@@ -335,4 +400,18 @@ var collations = []*Collation{
 	{245, "utf8mb4", "utf8mb4_croatian_ci", false},
 	{246, "utf8mb4", "utf8mb4_unicode_520_ci", false},
 	{247, "utf8mb4", "utf8mb4_vietnamese_ci", false},
+}
+
+// init method always puts to the end of file.
+func init() {
+	for _, c := range charsetInfos {
+		charsets[c.Name] = c
+	}
+	for _, c := range collations {
+		charset, ok := charsets[c.CharsetName]
+		if !ok {
+			continue
+		}
+		charset.Collations[c.Name] = c
+	}
 }

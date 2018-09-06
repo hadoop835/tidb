@@ -14,167 +14,231 @@
 package infoschema
 
 import (
-	"encoding/json"
+	"sort"
 	"sync/atomic"
 
-	"github.com/juju/errors"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/table"
+	"github.com/pingcap/tidb/terror"
+)
+
+var (
+	// ErrDatabaseDropExists returns for dropping a non-existent database.
+	ErrDatabaseDropExists = terror.ClassSchema.New(codeDBDropExists, "Can't drop database '%s'; database doesn't exist")
+	// ErrDatabaseNotExists returns for database not exists.
+	ErrDatabaseNotExists = terror.ClassSchema.New(codeDatabaseNotExists, "Unknown database '%s'")
+	// ErrTableNotExists returns for table not exists.
+	ErrTableNotExists = terror.ClassSchema.New(codeTableNotExists, "Table '%s.%s' doesn't exist")
+	// ErrColumnNotExists returns for column not exists.
+	ErrColumnNotExists = terror.ClassSchema.New(codeColumnNotExists, "Unknown column '%s' in '%s'")
+	// ErrForeignKeyNotMatch returns for foreign key not match.
+	ErrForeignKeyNotMatch = terror.ClassSchema.New(codeWrongFkDef, "Incorrect foreign key definition for '%s': Key reference and table reference don't match")
+	// ErrCannotAddForeign returns for foreign key exists.
+	ErrCannotAddForeign = terror.ClassSchema.New(codeCannotAddForeign, "Cannot add foreign key constraint")
+	// ErrForeignKeyNotExists returns for foreign key not exists.
+	ErrForeignKeyNotExists = terror.ClassSchema.New(codeForeignKeyNotExists, "Can't DROP '%s'; check that column/key exists")
+	// ErrDatabaseExists returns for database already exists.
+	ErrDatabaseExists = terror.ClassSchema.New(codeDatabaseExists, "Can't create database '%s'; database exists")
+	// ErrTableExists returns for table already exists.
+	ErrTableExists = terror.ClassSchema.New(codeTableExists, "Table '%s' already exists")
+	// ErrTableDropExists returns for dropping a non-existent table.
+	ErrTableDropExists = terror.ClassSchema.New(codeBadTable, "Unknown table '%s'")
+	// ErrColumnExists returns for column already exists.
+	ErrColumnExists = terror.ClassSchema.New(codeColumnExists, "Duplicate column name '%s'")
+	// ErrIndexExists returns for index already exists.
+	ErrIndexExists = terror.ClassSchema.New(codeIndexExists, "Duplicate Index")
+	// ErrKeyNameDuplicate returns for index duplicate when rename index.
+	ErrKeyNameDuplicate = terror.ClassSchema.New(codeKeyNameDuplicate, "Duplicate key name '%s'")
+	// ErrKeyNotExists returns for index not exists.
+	ErrKeyNotExists = terror.ClassSchema.New(codeKeyNotExists, "Key '%s' doesn't exist in table '%s'")
+	// ErrMultiplePriKey returns for multiple primary keys.
+	ErrMultiplePriKey = terror.ClassSchema.New(codeMultiplePriKey, "Multiple primary key defined")
+	// ErrTooManyKeyParts returns for too many key parts.
+	ErrTooManyKeyParts = terror.ClassSchema.New(codeTooManyKeyParts, "Too many key parts specified; max %d parts allowed")
 )
 
 // InfoSchema is the interface used to retrieve the schema information.
 // It works as a in memory cache and doesn't handle any schema change.
 // InfoSchema is read-only, and the returned value is a copy.
+// TODO: add more methods to retrieve tables and columns.
 type InfoSchema interface {
 	SchemaByName(schema model.CIStr) (*model.DBInfo, bool)
 	SchemaExists(schema model.CIStr) bool
 	TableByName(schema, table model.CIStr) (table.Table, error)
 	TableExists(schema, table model.CIStr) bool
-	ColumnByName(schema, table, column model.CIStr) (*model.ColumnInfo, bool)
-	ColumnExists(schema, table, column model.CIStr) bool
-	IndexByName(schema, table, index model.CIStr) (*model.IndexInfo, bool)
 	SchemaByID(id int64) (*model.DBInfo, bool)
 	TableByID(id int64) (table.Table, bool)
-	ColumnByID(id int64) (*model.ColumnInfo, bool)
-	ColumnIndices(id int64) []*model.IndexInfo
+	AllocByID(id int64) (autoid.Allocator, bool)
 	AllSchemaNames() []string
 	AllSchemas() []*model.DBInfo
 	Clone() (result []*model.DBInfo)
 	SchemaTables(schema model.CIStr) []table.Table
-	// TODO: add more methods to retrieve tables and columns.
+	SchemaMetaVersion() int64
 }
 
-// Infomation Schema Name.
+// Information Schema Name.
 const (
 	Name = "INFORMATION_SCHEMA"
 )
 
+type sortedTables []table.Table
+
+func (s sortedTables) Len() int {
+	return len(s)
+}
+
+func (s sortedTables) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+}
+
+func (s sortedTables) Less(i, j int) bool {
+	return s[i].Meta().ID < s[j].Meta().ID
+}
+
+func (s sortedTables) searchTable(id int64) int {
+	idx := sort.Search(len(s), func(i int) bool {
+		return s[i].Meta().ID >= id
+	})
+	if idx == len(s) || s[idx].Meta().ID != id {
+		return -1
+	}
+	return idx
+}
+
+type schemaTables struct {
+	dbInfo *model.DBInfo
+	tables map[string]table.Table
+}
+
+const bucketCount = 512
+
 type infoSchema struct {
-	schemaNameToID map[string]int64
-	tableNameToID  map[tableName]int64
-	columnNameToID map[columnName]int64
-	schemas        map[int64]*model.DBInfo
-	tables         map[int64]table.Table
-	columns        map[int64]*model.ColumnInfo
-	indices        map[indexName]*model.IndexInfo
-	columnIndices  map[int64][]*model.IndexInfo
+	schemaMap map[string]*schemaTables
+
+	// sortedTablesBuckets is a slice of sortedTables, a table's bucket index is (tableID % bucketCount).
+	sortedTablesBuckets []sortedTables
+
+	// schemaMetaVersion is the version of schema, and we should check version when change schema.
+	schemaMetaVersion int64
 }
 
-type tableName struct {
-	schema string
-	table  string
+// MockInfoSchema only serves for test.
+func MockInfoSchema(tbList []*model.TableInfo) InfoSchema {
+	result := &infoSchema{}
+	result.schemaMap = make(map[string]*schemaTables)
+	result.sortedTablesBuckets = make([]sortedTables, bucketCount)
+	dbInfo := &model.DBInfo{ID: 0, Name: model.NewCIStr("test"), Tables: tbList}
+	tableNames := &schemaTables{
+		dbInfo: dbInfo,
+		tables: make(map[string]table.Table),
+	}
+	result.schemaMap["test"] = tableNames
+	for _, tb := range tbList {
+		tbl := table.MockTableFromMeta(tb)
+		tableNames.tables[tb.Name.L] = tbl
+		bucketIdx := tableBucketIdx(tb.ID)
+		result.sortedTablesBuckets[bucketIdx] = append(result.sortedTablesBuckets[bucketIdx], tbl)
+	}
+	for i := range result.sortedTablesBuckets {
+		sort.Sort(result.sortedTablesBuckets[i])
+	}
+	return result
 }
 
-type columnName struct {
-	tableName
-	name string
-}
-
-type indexName struct {
-	tableName
-	name string
-}
+var _ InfoSchema = (*infoSchema)(nil)
 
 func (is *infoSchema) SchemaByName(schema model.CIStr) (val *model.DBInfo, ok bool) {
-	id, ok := is.schemaNameToID[schema.L]
+	tableNames, ok := is.schemaMap[schema.L]
 	if !ok {
 		return
 	}
-	val, ok = is.schemas[id]
-	return
+	return tableNames.dbInfo, true
+}
+
+func (is *infoSchema) SchemaMetaVersion() int64 {
+	return is.schemaMetaVersion
 }
 
 func (is *infoSchema) SchemaExists(schema model.CIStr) bool {
-	_, ok := is.schemaNameToID[schema.L]
+	_, ok := is.schemaMap[schema.L]
 	return ok
 }
 
 func (is *infoSchema) TableByName(schema, table model.CIStr) (t table.Table, err error) {
-	id, ok := is.tableNameToID[tableName{schema: schema.L, table: table.L}]
-	if !ok {
-		return nil, errors.Errorf("table %s.%s does not exist", schema, table)
+	if tbNames, ok := is.schemaMap[schema.L]; ok {
+		if t, ok = tbNames.tables[table.L]; ok {
+			return
+		}
 	}
-	t = is.tables[id]
-	return
+	return nil, ErrTableNotExists.GenByArgs(schema, table)
 }
 
 func (is *infoSchema) TableExists(schema, table model.CIStr) bool {
-	_, ok := is.tableNameToID[tableName{schema: schema.L, table: table.L}]
-	return ok
-}
-
-func (is *infoSchema) ColumnByName(schema, table, column model.CIStr) (val *model.ColumnInfo, ok bool) {
-	id, ok := is.columnNameToID[columnName{tableName: tableName{schema: schema.L, table: table.L}, name: column.L}]
-	if !ok {
-		return
+	if tbNames, ok := is.schemaMap[schema.L]; ok {
+		if _, ok = tbNames.tables[table.L]; ok {
+			return true
+		}
 	}
-	val, ok = is.columns[id]
-	return
-}
-
-func (is *infoSchema) ColumnExists(schema, table, column model.CIStr) bool {
-	_, ok := is.columnNameToID[columnName{tableName: tableName{schema: schema.L, table: table.L}, name: column.L}]
-	return ok
-}
-
-func (is *infoSchema) IndexByName(schema, table, index model.CIStr) (val *model.IndexInfo, ok bool) {
-	val, ok = is.indices[indexName{tableName: tableName{schema: schema.L, table: table.L}, name: index.L}]
-	return
+	return false
 }
 
 func (is *infoSchema) SchemaByID(id int64) (val *model.DBInfo, ok bool) {
-	val, ok = is.schemas[id]
-	return
+	for _, v := range is.schemaMap {
+		if v.dbInfo.ID == id {
+			return v.dbInfo, true
+		}
+	}
+	return nil, false
 }
 
 func (is *infoSchema) TableByID(id int64) (val table.Table, ok bool) {
-	val, ok = is.tables[id]
-	return
+	slice := is.sortedTablesBuckets[tableBucketIdx(id)]
+	idx := slice.searchTable(id)
+	if idx == -1 {
+		return nil, false
+	}
+	return slice[idx], true
 }
 
-func (is *infoSchema) ColumnByID(id int64) (val *model.ColumnInfo, ok bool) {
-	val, ok = is.columns[id]
-	return
-}
-
-func (is *infoSchema) ColumnIndices(id int64) (indices []*model.IndexInfo) {
-	return is.columnIndices[id]
+func (is *infoSchema) AllocByID(id int64) (autoid.Allocator, bool) {
+	tbl, ok := is.TableByID(id)
+	if !ok {
+		return nil, false
+	}
+	return tbl.Allocator(nil), true
 }
 
 func (is *infoSchema) AllSchemaNames() (names []string) {
-	for _, v := range is.schemas {
-		names = append(names, v.Name.O)
+	for _, v := range is.schemaMap {
+		names = append(names, v.dbInfo.Name.O)
 	}
 	return
 }
 
 func (is *infoSchema) AllSchemas() (schemas []*model.DBInfo) {
-	for _, v := range is.schemas {
-		schemas = append(schemas, v)
+	for _, v := range is.schemaMap {
+		schemas = append(schemas, v.dbInfo)
 	}
 	return
 }
 
 func (is *infoSchema) SchemaTables(schema model.CIStr) (tables []table.Table) {
-	di, ok := is.SchemaByName(schema)
+	schemaTables, ok := is.schemaMap[schema.L]
 	if !ok {
 		return
 	}
-	for _, ti := range di.Tables {
-		tables = append(tables, is.tables[ti.ID])
+	for _, tbl := range schemaTables.tables {
+		tables = append(tables, tbl)
 	}
 	return
 }
 
 func (is *infoSchema) Clone() (result []*model.DBInfo) {
-	for _, v := range is.schemas {
-		// TODO: this is a temporary solution, change to real clone later.
-		b, _ := json.Marshal(v)
-		var newInfo model.DBInfo
-		json.Unmarshal(b, &newInfo)
-		result = append(result, &newInfo)
+	for _, v := range is.schemaMap {
+		result = append(result, v.dbInfo.Clone())
 	}
 	return
 }
@@ -187,49 +251,97 @@ type Handle struct {
 
 // NewHandle creates a new Handle.
 func NewHandle(store kv.Storage) *Handle {
-	return &Handle{
+	h := &Handle{
 		store: store,
 	}
-}
-
-// Set sets DBInfo to information schema.
-func (h *Handle) Set(newInfo []*model.DBInfo) {
-	info := &infoSchema{
-		schemaNameToID: map[string]int64{},
-		tableNameToID:  map[tableName]int64{},
-		columnNameToID: map[columnName]int64{},
-		schemas:        map[int64]*model.DBInfo{},
-		tables:         map[int64]table.Table{},
-		columns:        map[int64]*model.ColumnInfo{},
-		indices:        map[indexName]*model.IndexInfo{},
-		columnIndices:  map[int64][]*model.IndexInfo{},
-	}
-	for _, di := range newInfo {
-		info.schemas[di.ID] = di
-		info.schemaNameToID[di.Name.L] = di.ID
-		for _, t := range di.Tables {
-			alloc := autoid.NewAllocator(h.store)
-			info.tables[t.ID] = table.TableFromMeta(di.Name.L, alloc, t)
-			tname := tableName{di.Name.L, t.Name.L}
-			info.tableNameToID[tname] = t.ID
-			for _, c := range t.Columns {
-				info.columns[c.ID] = c
-				info.columnNameToID[columnName{tname, c.Name.L}] = c.ID
-			}
-			for _, idx := range t.Indices {
-				info.indices[indexName{tname, idx.Name.L}] = idx
-				for _, idxCol := range idx.Columns {
-					columnID := t.Columns[idxCol.Offset].ID
-					columnIndices := info.columnIndices[columnID]
-					info.columnIndices[columnID] = append(columnIndices, idx)
-				}
-			}
-		}
-	}
-	h.value.Store(info)
+	return h
 }
 
 // Get gets information schema from Handle.
 func (h *Handle) Get() InfoSchema {
-	return h.value.Load().(InfoSchema)
+	v := h.value.Load()
+	schema, _ := v.(InfoSchema)
+	return schema
+}
+
+// EmptyClone creates a new Handle with the same store and memSchema, but the value is not set.
+func (h *Handle) EmptyClone() *Handle {
+	newHandle := &Handle{
+		store: h.store,
+	}
+	return newHandle
+}
+
+// Schema error codes.
+const (
+	codeDBDropExists      terror.ErrCode = 1008
+	codeDatabaseNotExists                = 1049
+	codeTableNotExists                   = 1146
+	codeColumnNotExists                  = 1054
+
+	codeCannotAddForeign    = 1215
+	codeForeignKeyNotExists = 1091
+	codeWrongFkDef          = 1239
+
+	codeDatabaseExists   = 1007
+	codeTableExists      = 1050
+	codeBadTable         = 1051
+	codeColumnExists     = 1060
+	codeIndexExists      = 1831
+	codeMultiplePriKey   = 1068
+	codeTooManyKeyParts  = 1070
+	codeKeyNameDuplicate = 1061
+	codeKeyNotExists     = 1176
+)
+
+func init() {
+	schemaMySQLErrCodes := map[terror.ErrCode]uint16{
+		codeDBDropExists:        mysql.ErrDBDropExists,
+		codeDatabaseNotExists:   mysql.ErrBadDB,
+		codeTableNotExists:      mysql.ErrNoSuchTable,
+		codeColumnNotExists:     mysql.ErrBadField,
+		codeCannotAddForeign:    mysql.ErrCannotAddForeign,
+		codeWrongFkDef:          mysql.ErrWrongFkDef,
+		codeForeignKeyNotExists: mysql.ErrCantDropFieldOrKey,
+		codeDatabaseExists:      mysql.ErrDBCreateExists,
+		codeTableExists:         mysql.ErrTableExists,
+		codeBadTable:            mysql.ErrBadTable,
+		codeColumnExists:        mysql.ErrDupFieldName,
+		codeIndexExists:         mysql.ErrDupIndex,
+		codeMultiplePriKey:      mysql.ErrMultiplePriKey,
+		codeTooManyKeyParts:     mysql.ErrTooManyKeyParts,
+		codeKeyNameDuplicate:    mysql.ErrDupKeyName,
+		codeKeyNotExists:        mysql.ErrKeyDoesNotExist,
+	}
+	terror.ErrClassToMySQLCodes[terror.ClassSchema] = schemaMySQLErrCodes
+	initInfoSchemaDB()
+}
+
+var (
+	infoSchemaDB *model.DBInfo
+)
+
+func initInfoSchemaDB() {
+	dbID := autoid.GenLocalSchemaID()
+	infoSchemaTables := make([]*model.TableInfo, 0, len(tableNameToColumns))
+	for name, cols := range tableNameToColumns {
+		tableInfo := buildTableMeta(name, cols)
+		infoSchemaTables = append(infoSchemaTables, tableInfo)
+		tableInfo.ID = autoid.GenLocalSchemaID()
+		for _, c := range tableInfo.Columns {
+			c.ID = autoid.GenLocalSchemaID()
+		}
+	}
+	infoSchemaDB = &model.DBInfo{
+		ID:      dbID,
+		Name:    model.NewCIStr(Name),
+		Charset: mysql.DefaultCharset,
+		Collate: mysql.DefaultCollationName,
+		Tables:  infoSchemaTables,
+	}
+}
+
+// IsMemoryDB checks if the db is in memory.
+func IsMemoryDB(dbName string) bool {
+	return dbName == "information_schema" || dbName == "performance_schema"
 }
