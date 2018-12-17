@@ -14,24 +14,27 @@
 package ddl
 
 import (
+	"context"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/store/mockstore"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/mock"
-	"golang.org/x/net/context"
+	log "github.com/sirupsen/logrus"
 )
 
 type DDLForTest interface {
@@ -75,18 +78,31 @@ func (d *ddl) restartWorkers(ctx context.Context) {
 	for _, worker := range d.workers {
 		worker.wg.Add(1)
 		worker.quitCh = make(chan struct{})
-		go worker.start(d.ddlCtx)
+		w := worker
+		go util.WithRecovery(func() { w.start(d.ddlCtx) },
+			func(r interface{}) {
+				if r != nil {
+					log.Errorf("[ddl-%s] ddl %s meet panic", w, d.uuid)
+				}
+			})
 		asyncNotify(worker.ddlJobCh)
 	}
 }
 
+// TestLeakCheckCnt is the check count in the pacakge of ddl.
+// In this package CustomParallelSuiteFlag is true, so we need to increase check count.
+const TestLeakCheckCnt = 1000
+
 func TestT(t *testing.T) {
 	CustomVerboseFlag = true
+	*CustomParallelSuiteFlag = true
 	logLevel := os.Getenv("log_level")
 	logutil.InitLogger(&logutil.LogConfig{
 		Level:  logLevel,
 		Format: "highlight",
 	})
+	autoid.SetStep(5000)
+	ReorgWaitTimeout = 30 * time.Millisecond
 	TestingT(t)
 }
 
@@ -108,9 +124,9 @@ func testNewDDL(ctx context.Context, etcdCli *clientv3.Client, store kv.Storage,
 }
 
 func getSchemaVer(c *C, ctx sessionctx.Context) int64 {
-	err := ctx.NewTxn()
+	err := ctx.NewTxn(context.Background())
 	c.Assert(err, IsNil)
-	m := meta.NewMeta(ctx.Txn())
+	m := meta.NewMeta(ctx.Txn(true))
 	ver, err := m.GetSchemaVersion()
 	c.Assert(err, IsNil)
 	return ver
@@ -138,7 +154,7 @@ func checkHistoryJob(c *C, job *model.Job) {
 }
 
 func checkHistoryJobArgs(c *C, ctx sessionctx.Context, id int64, args *historyJobArgs) {
-	t := meta.NewMeta(ctx.Txn())
+	t := meta.NewMeta(ctx.Txn(true))
 	historyJob, err := t.GetHistoryDDLJob(id)
 	c.Assert(err, IsNil)
 	c.Assert(historyJob.BinlogInfo.FinishedTS, Greater, uint64(0))
@@ -173,6 +189,21 @@ func buildCreateIdxJob(dbInfo *model.DBInfo, tblInfo *model.TableInfo, unique bo
 
 func testCreateIndex(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, unique bool, indexName string, colName string) *model.Job {
 	job := buildCreateIdxJob(dbInfo, tblInfo, unique, indexName, colName)
+	err := d.doDDLJob(ctx, job)
+	c.Assert(err, IsNil)
+	v := getSchemaVer(c, ctx)
+	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v, tbl: tblInfo})
+	return job
+}
+
+func testAddColumn(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, args []interface{}) *model.Job {
+	job := &model.Job{
+		SchemaID:   dbInfo.ID,
+		TableID:    tblInfo.ID,
+		Type:       model.ActionAddColumn,
+		Args:       args,
+		BinlogInfo: &model.HistoryInfo{},
+	}
 	err := d.doDDLJob(ctx, job)
 	c.Assert(err, IsNil)
 	v := getSchemaVer(c, ctx)

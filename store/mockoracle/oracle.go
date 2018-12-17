@@ -14,13 +14,12 @@
 package mockoracle
 
 import (
+	"context"
 	"sync"
 	"time"
 
+	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/store/tikv/oracle"
-	"github.com/pkg/errors"
-
-	"golang.org/x/net/context"
 )
 
 var errStopped = errors.New("stopped")

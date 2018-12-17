@@ -16,43 +16,44 @@ package main
 import (
 	"flag"
 	"fmt"
-	"net"
 	"os"
-	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/opentracing/opentracing-go"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/pd/client"
+	pumpcli "github.com/pingcap/tidb-tools/tidb-binlog/pump_client"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
-	"github.com/pingcap/tidb/plan"
+	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/server"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/sessionctx/binloginfo"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/statistics"
+	kvstore "github.com/pingcap/tidb/store"
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/store/tikv/gcworker"
-	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/printer"
+	"github.com/pingcap/tidb/util/signal"
 	"github.com/pingcap/tidb/util/systimemon"
 	"github.com/pingcap/tidb/x-server"
-	binlog "github.com/pingcap/tipb/go-binlog"
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/push"
 	log "github.com/sirupsen/logrus"
-	"google.golang.org/grpc"
+	"github.com/struCoder/pidusage"
 )
 
 // Flag Names
@@ -64,8 +65,9 @@ const (
 	nmHost             = "host"
 	nmAdvertiseAddress = "advertise-address"
 	nmPort             = "P"
+	nmCors             = "cors"
 	nmSocket           = "socket"
-	nmBinlogSocket     = "binlog-socket"
+	nmEnableBinlog     = "enable-binlog"
 	nmRunDDL           = "run-ddl"
 	nmLogLevel         = "L"
 	nmLogFile          = "log-file"
@@ -91,8 +93,9 @@ var (
 	host             = flag.String(nmHost, "0.0.0.0", "tidb server host")
 	advertiseAddress = flag.String(nmAdvertiseAddress, "", "tidb server advertise IP")
 	port             = flag.String(nmPort, "4000", "tidb server port")
+	cors             = flag.String(nmCors, "", "tidb server allow cors origin")
 	socket           = flag.String(nmSocket, "", "The socket file to use for connection.")
-	binlogSocket     = flag.String(nmBinlogSocket, "", "socket file to write binlog")
+	enableBinlog     = flagBoolean(nmEnableBinlog, false, "enable generate binlog")
 	runDDL           = flagBoolean(nmRunDDL, true, "run ddl worker on this tidb-server")
 	ddlLease         = flag.String(nmDdlLease, "45s", "schema lease duration, very dangerous to change only if you know what you do")
 	tokenLimit       = flag.Int(nmTokenLimit, 1000, "the limit of concurrent executed sessions")
@@ -141,17 +144,17 @@ func main() {
 	setupMetrics()
 	createStoreAndDomain()
 	createServer()
-	setupSignalHandler()
+	signal.SetupSignalHandler(serverShutdown)
 	runServer()
 	cleanup()
 	os.Exit(0)
 }
 
 func registerStores() {
-	err := session.RegisterStore("tikv", tikv.Driver{})
+	err := kvstore.Register("tikv", tikv.Driver{})
 	terror.MustNil(err)
 	tikv.NewGCHandlerFunc = gcworker.NewGCWorker
-	err = session.RegisterStore("mocktikv", mockstore.MockDriver{})
+	err = kvstore.Register("mocktikv", mockstore.MockDriver{})
 	terror.MustNil(err)
 }
 
@@ -162,7 +165,7 @@ func registerMetrics() {
 func createStoreAndDomain() {
 	fullPath := fmt.Sprintf("%s://%s", cfg.Store, cfg.Path)
 	var err error
-	storage, err = session.NewStore(fullPath)
+	storage, err = kvstore.New(fullPath)
 	terror.MustNil(err)
 	// Bootstrap a session to load information schema.
 	dom, err = session.BootstrapSession(storage)
@@ -170,20 +173,23 @@ func createStoreAndDomain() {
 }
 
 func setupBinlogClient() {
-	if cfg.Binlog.BinlogSocket == "" {
+	if !cfg.Binlog.Enable {
 		return
 	}
-	dialerOpt := grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
-		return net.DialTimeout("unix", addr, timeout)
-	})
-	clientConn, err := session.DialPumpClientWithRetry(cfg.Binlog.BinlogSocket, util.DefaultMaxRetries, dialerOpt)
-	terror.MustNil(err)
+
 	if cfg.Binlog.IgnoreError {
 		binloginfo.SetIgnoreError(true)
 	}
-	binloginfo.SetGRPCTimeout(parseDuration(cfg.Binlog.WriteTimeout))
-	binloginfo.SetPumpClient(binlog.NewPumpClient(clientConn))
-	log.Infof("created binlog client at %s, ignore error %v", cfg.Binlog.BinlogSocket, cfg.Binlog.IgnoreError)
+
+	client, err := pumpcli.NewPumpsClient(cfg.Path, parseDuration(cfg.Binlog.WriteTimeout), pd.SecurityOption{
+		CAPath:   cfg.Security.ClusterSSLCA,
+		CertPath: cfg.Security.ClusterSSLCert,
+		KeyPath:  cfg.Security.ClusterSSLKey,
+	})
+	terror.MustNil(err)
+
+	binloginfo.SetPumpsClient(client)
+	log.Infof("create pumps client success, ignore binlog error %v", cfg.Binlog.IgnoreError)
 }
 
 // Prometheus push.
@@ -278,6 +284,10 @@ func overrideConfig() {
 		terror.MustNil(err)
 		cfg.Port = uint(p)
 	}
+	if actualFlags[nmCors] {
+		fmt.Println(cors)
+		cfg.Cors = *cors
+	}
 	if actualFlags[nmStore] {
 		cfg.Store = *store
 	}
@@ -287,8 +297,8 @@ func overrideConfig() {
 	if actualFlags[nmSocket] {
 		cfg.Socket = *socket
 	}
-	if actualFlags[nmBinlogSocket] {
-		cfg.Binlog.BinlogSocket = *binlogSocket
+	if actualFlags[nmEnableBinlog] {
+		cfg.Binlog.Enable = *enableBinlog
 	}
 	if actualFlags[nmRunDDL] {
 		cfg.RunDDL = *runDDL
@@ -371,6 +381,11 @@ func validateConfig() {
 		log.Errorf("lower-case-table-names should be 0 or 1 or 2.")
 		os.Exit(-1)
 	}
+
+	if cfg.TxnLocalLatches.Enabled && cfg.TxnLocalLatches.Capacity == 0 {
+		log.Errorf("txn-local-latches.capacity can not be 0")
+		os.Exit(-1)
+	}
 }
 
 func setGlobalVars() {
@@ -385,12 +400,27 @@ func setGlobalVars() {
 	statistics.RatioOfPseudoEstimate = cfg.Performance.PseudoEstimateRatio
 	ddl.RunWorker = cfg.RunDDL
 	ddl.EnableSplitTableRegion = cfg.SplitTable
-	plan.AllowCartesianProduct = cfg.Performance.CrossJoin
+	plannercore.AllowCartesianProduct = cfg.Performance.CrossJoin
 	privileges.SkipWithGrant = cfg.Security.SkipGrantTable
+	variable.ForcePriority = int32(mysql.Str2Priority(cfg.Performance.ForcePriority))
 
-	plan.SetPreparedPlanCache(cfg.PreparedPlanCache.Enabled)
-	if plan.PreparedPlanCacheEnabled() {
-		plan.PreparedPlanCacheCapacity = cfg.PreparedPlanCache.Capacity
+	variable.SysVars[variable.TIDBMemQuotaQuery].Value = strconv.FormatInt(cfg.MemQuotaQuery, 10)
+	variable.SysVars["lower_case_table_names"].Value = strconv.Itoa(cfg.LowerCaseTableNames)
+
+	// For CI environment we default enable prepare-plan-cache.
+	plannercore.SetPreparedPlanCache(config.CheckTableBeforeDrop || cfg.PreparedPlanCache.Enabled)
+	if plannercore.PreparedPlanCacheEnabled() {
+		plannercore.PreparedPlanCacheCapacity = cfg.PreparedPlanCache.Capacity
+		plannercore.PreparedPlanCacheMemoryGuardRatio = cfg.PreparedPlanCache.MemoryGuardRatio
+		if plannercore.PreparedPlanCacheMemoryGuardRatio < 0.0 || plannercore.PreparedPlanCacheMemoryGuardRatio > 1.0 {
+			plannercore.PreparedPlanCacheMemoryGuardRatio = 0.1
+		}
+		plannercore.PreparedPlanCacheMaxMemory = cfg.Performance.MaxMemory
+		total, err := memory.MemTotal()
+		terror.MustNil(err)
+		if plannercore.PreparedPlanCacheMaxMemory > total || plannercore.PreparedPlanCacheMaxMemory <= 0 {
+			plannercore.PreparedPlanCacheMaxMemory = total
+		}
 	}
 
 	if cfg.TiKVClient.GrpcConnectionCount > 0 {
@@ -398,9 +428,6 @@ func setGlobalVars() {
 	}
 	tikv.GrpcKeepAliveTime = time.Duration(cfg.TiKVClient.GrpcKeepAliveTime) * time.Second
 	tikv.GrpcKeepAliveTimeout = time.Duration(cfg.TiKVClient.GrpcKeepAliveTimeout) * time.Second
-
-	// set lower_case_table_names
-	variable.SysVars["lower_case_table_names"].Value = strconv.Itoa(cfg.LowerCaseTableNames)
 
 	tikv.CommitMaxBackoff = int(parseDuration(cfg.TiKVClient.CommitTimeout).Seconds() * 1000)
 }
@@ -436,37 +463,14 @@ func createServer() {
 	}
 }
 
-func setupSignalHandler() {
-	usrDefSignalChan := make(chan os.Signal, 1)
-	signal.Notify(usrDefSignalChan, syscall.SIGUSR1)
-	go func() {
-		buf := make([]byte, 1<<16)
-		for {
-			sig := <-usrDefSignalChan
-			if sig == syscall.SIGUSR1 {
-				stackLen := runtime.Stack(buf, true)
-				log.Printf("\n=== Got signal [%s] to dump goroutine stack. ===\n%s\n=== Finished dumping goroutine stack. ===\n", sig, buf[:stackLen])
-			}
-		}
-	}()
-
-	closeSignalChan := make(chan os.Signal, 1)
-	signal.Notify(closeSignalChan,
-		syscall.SIGHUP,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-		syscall.SIGQUIT)
-	go func() {
-		sig := <-closeSignalChan
-		log.Infof("Got signal [%s] to exit.", sig)
-		if sig == syscall.SIGQUIT {
-			graceful = true
-		}
-		if xsvr != nil {
-			xsvr.Close() // Should close xserver before server.
-		}
-		svr.Close()
-	}()
+func serverShutdown(isgraceful bool) {
+	if isgraceful {
+		graceful = true
+	}
+	if xsvr != nil {
+		xsvr.Close() // Should close xserver before server.
+	}
+	svr.Close()
 }
 
 func setupMetrics() {
@@ -482,11 +486,20 @@ func setupMetrics() {
 		if callBackCount >= 5 {
 			callBackCount = 0
 			metrics.KeepAliveCounter.Inc()
+			updateCPUUsageMetrics()
 		}
 	}
 	go systimemon.StartMonitor(time.Now, systimeErrHandler, sucessCallBack)
 
 	pushMetric(cfg.Status.MetricsAddr, time.Duration(cfg.Status.MetricsInterval)*time.Second)
+}
+
+func updateCPUUsageMetrics() {
+	sysInfo, err := pidusage.GetStat(os.Getpid())
+	if err != nil {
+		return
+	}
+	metrics.CPUUsagePercentageGauge.Set(sysInfo.CPU)
 }
 
 func setupTracing() {
@@ -516,6 +529,8 @@ func closeDomainAndStorage() {
 func cleanup() {
 	if graceful {
 		svr.GracefulDown()
+	} else {
+		svr.KillAllConnections()
 	}
 	closeDomainAndStorage()
 }

@@ -14,21 +14,21 @@
 package domain
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/clientv3/concurrency"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/ddl"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/owner"
 	"github.com/pingcap/tidb/util/hack"
 	"github.com/pingcap/tidb/util/printer"
-	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
 )
 
 const (

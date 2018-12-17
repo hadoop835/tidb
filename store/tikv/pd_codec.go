@@ -14,11 +14,12 @@
 package tikv
 
 import (
+	"context"
+
+	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/pd/pd-client"
+	"github.com/pingcap/pd/client"
 	"github.com/pingcap/tidb/util/codec"
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 )
 
 type codecPDClient struct {

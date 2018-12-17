@@ -18,6 +18,7 @@
 package session
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"runtime/debug"
@@ -25,17 +26,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/auth"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/infoschema"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/util/auth"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/timeutil"
-	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
 )
 
 const (

@@ -16,17 +16,18 @@ package aggregation
 import (
 	"bytes"
 	"fmt"
-	"github.com/pingcap/tidb/ast"
+
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/charset"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/expression"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tipb/go-tipb"
-	"github.com/pkg/errors"
 )
 
 // Aggregation stands for aggregate functions.
@@ -41,10 +42,10 @@ type Aggregation interface {
 	// GetResult will be called when all data have been processed.
 	GetResult(evalCtx *AggEvaluateContext) types.Datum
 
-	// Create a new AggEvaluateContext for the aggregation function.
+	// CreateContext creates a new AggEvaluateContext for the aggregation function.
 	CreateContext(sc *stmtctx.StatementContext) *AggEvaluateContext
 
-	// Reset the content of the evaluate context.
+	// ResetContext resets the content of the evaluate context.
 	ResetContext(sc *stmtctx.StatementContext, evalCtx *AggEvaluateContext)
 
 	// GetFinalAggFunc constructs the final agg functions, only used in parallel execution.
@@ -63,7 +64,7 @@ func NewDistAggFunc(expr *tipb.Expr, fieldTps []*types.FieldType, sc *stmtctx.St
 	for _, child := range expr.Children {
 		arg, err := expression.PBToExpr(child, fieldTps, sc)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, err
 		}
 		args = append(args, arg)
 	}
@@ -126,11 +127,10 @@ type aggFunction struct {
 }
 
 func newAggFunc(funcName string, args []expression.Expression, hasDistinct bool) aggFunction {
-	return aggFunction{AggFuncDesc: &AggFuncDesc{
-		Name:        funcName,
-		Args:        args,
-		HasDistinct: hasDistinct,
-	}}
+	agg := &AggFuncDesc{HasDistinct: hasDistinct}
+	agg.Name = funcName
+	agg.Args = args
+	return aggFunction{AggFuncDesc: agg}
 }
 
 // CreateContext implements Aggregation interface.
@@ -153,7 +153,7 @@ func (af *aggFunction) updateSum(sc *stmtctx.StatementContext, evalCtx *AggEvalu
 	a := af.Args[0]
 	value, err := a.Eval(row)
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 	if value.IsNull() {
 		return nil
@@ -161,7 +161,7 @@ func (af *aggFunction) updateSum(sc *stmtctx.StatementContext, evalCtx *AggEvalu
 	if af.HasDistinct {
 		d, err1 := evalCtx.DistinctChecker.Check([]types.Datum{value})
 		if err1 != nil {
-			return errors.Trace(err1)
+			return err1
 		}
 		if !d {
 			return nil
@@ -169,7 +169,7 @@ func (af *aggFunction) updateSum(sc *stmtctx.StatementContext, evalCtx *AggEvalu
 	}
 	evalCtx.Value, err = calculateSum(sc, evalCtx.Value, value)
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 	evalCtx.Count++
 	return nil

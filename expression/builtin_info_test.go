@@ -17,11 +17,11 @@ import (
 	"math"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/auth"
+	"github.com/pingcap/parser/charset"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/util/auth"
-	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/printer"
@@ -84,7 +84,7 @@ func (s *testEvaluatorSuite) TestCurrentUser(c *C) {
 	defer testleak.AfterTest(c)()
 	ctx := mock.NewContext()
 	sessionVars := ctx.GetSessionVars()
-	sessionVars.User = &auth.UserIdentity{Username: "root", Hostname: "localhost"}
+	sessionVars.User = &auth.UserIdentity{Username: "root", Hostname: "localhost", AuthUsername: "root", AuthHostname: "localhost"}
 
 	fc := funcs[ast.CurrentUser]
 	f, err := fc.getFunction(ctx, nil)
@@ -154,7 +154,7 @@ func (s *testEvaluatorSuite) TestRowCount(c *C) {
 	defer testleak.AfterTest(c)()
 	ctx := mock.NewContext()
 	sessionVars := ctx.GetSessionVars()
-	sessionVars.PrevAffectedRows = 10
+	sessionVars.StmtCtx.PrevAffectedRows = 10
 
 	f, err := funcs[ast.RowCount].getFunction(ctx, nil)
 	c.Assert(err, IsNil)
@@ -168,7 +168,7 @@ func (s *testEvaluatorSuite) TestRowCount(c *C) {
 	c.Assert(intResult, Equals, int64(10))
 }
 
-// Test case for tidb_server().
+// TestTiDBVersion for tidb_server().
 func (s *testEvaluatorSuite) TestTiDBVersion(c *C) {
 	defer testleak.AfterTest(c)()
 	f, err := newFunctionForTest(s.ctx, ast.TiDBVersion, s.primitiveValsToConstants([]interface{}{})...)
@@ -203,7 +203,7 @@ func (s *testEvaluatorSuite) TestLastInsertID(c *C) {
 			err error
 		)
 		if t.insertID > 0 {
-			s.ctx.GetSessionVars().PrevLastInsertID = t.insertID
+			s.ctx.GetSessionVars().StmtCtx.PrevLastInsertID = t.insertID
 		}
 
 		if t.args != nil {

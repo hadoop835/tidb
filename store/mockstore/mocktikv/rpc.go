@@ -15,20 +15,20 @@ package mocktikv
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/coprocessor"
 	"github.com/pingcap/kvproto/pkg/errorpb"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/store/tikv/tikvrpc"
-	"github.com/pingcap/tidb/terror"
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 )
 
 // For gofail injection.
@@ -229,7 +229,11 @@ func (h *rpcHandler) handleKvScan(req *kvrpcpb.ScanRequest) *kvrpcpb.ScanRespons
 	if !h.checkKeyInRegion(req.GetStartKey()) {
 		panic("KvScan: startKey not in region")
 	}
-	pairs := h.mvccStore.Scan(req.GetStartKey(), h.endKey, int(req.GetLimit()), req.GetVersion(), h.isolationLevel)
+	endKey := h.endKey
+	if len(req.EndKey) > 0 && (len(endKey) == 0 || bytes.Compare(req.EndKey, endKey) < 0) {
+		endKey = req.EndKey
+	}
+	pairs := h.mvccStore.Scan(req.GetStartKey(), endKey, int(req.GetLimit()), req.GetVersion(), h.isolationLevel)
 	return &kvrpcpb.ScanResponse{
 		Pairs: convertToPbPairs(pairs),
 	}
@@ -745,6 +749,7 @@ func (c *RPCClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.R
 		ctx1, cancel := context.WithCancel(ctx)
 		copStream, err := handler.handleCopStream(ctx1, r)
 		if err != nil {
+			cancel()
 			return nil, errors.Trace(err)
 		}
 

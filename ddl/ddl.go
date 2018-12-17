@@ -18,30 +18,32 @@
 package ddl
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/ngaut/pools"
-	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
+	pumpcli "github.com/pingcap/tidb-tools/tidb-binlog/pump_client"
 	"github.com/pingcap/tidb/ddl/util"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/metrics"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/owner"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/binloginfo"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/table"
-	"github.com/pingcap/tidb/terror"
-	"github.com/pkg/errors"
+	tidbutil "github.com/pingcap/tidb/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/twinj/uuid"
-	"golang.org/x/net/context"
 )
 
 const (
@@ -81,11 +83,13 @@ var (
 	errWaitReorgTimeout      = terror.ClassDDL.New(codeWaitReorgTimeout, "wait for reorganization timeout")
 	errInvalidStoreVer       = terror.ClassDDL.New(codeInvalidStoreVer, "invalid storage current version")
 
+	errUnknownPartition = terror.ClassDDL.New(codeUnknownPartition, mysql.MySQLErrName[mysql.ErrUnknownPartition])
 	// We don't support dropping column with index covered now.
-	errCantDropColWithIndex    = terror.ClassDDL.New(codeCantDropColWithIndex, "can't drop column with index")
-	errUnsupportedAddColumn    = terror.ClassDDL.New(codeUnsupportedAddColumn, "unsupported add column")
-	errUnsupportedModifyColumn = terror.ClassDDL.New(codeUnsupportedModifyColumn, "unsupported modify column %s")
-	errUnsupportedPKHandle     = terror.ClassDDL.New(codeUnsupportedDropPKHandle,
+	errCantDropColWithIndex     = terror.ClassDDL.New(codeCantDropColWithIndex, "can't drop column with index")
+	errUnsupportedAddColumn     = terror.ClassDDL.New(codeUnsupportedAddColumn, "unsupported add column")
+	errUnsupportedModifyColumn  = terror.ClassDDL.New(codeUnsupportedModifyColumn, "unsupported modify column %s")
+	errUnsupportedModifyCharset = terror.ClassDDL.New(codeUnsupportedModifyCharset, "unsupported modify %s")
+	errUnsupportedPKHandle      = terror.ClassDDL.New(codeUnsupportedDropPKHandle,
 		"unsupported drop integer primary key")
 	errUnsupportedCharset = terror.ClassDDL.New(codeUnsupportedCharset, "unsupported charset %s collate %s")
 
@@ -95,7 +99,7 @@ var (
 	errIncorrectPrefixKey   = terror.ClassDDL.New(codeIncorrectPrefixKey, "Incorrect prefix key; the used key part isn't a string, the used length is longer than the key part, or the storage engine doesn't support unique prefix keys")
 	errTooLongKey           = terror.ClassDDL.New(codeTooLongKey,
 		fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxPrefixLength))
-	errKeyColumnDoesNotExits    = terror.ClassDDL.New(codeKeyColumnDoesNotExits, "this key column doesn't exist in table")
+	errKeyColumnDoesNotExits    = terror.ClassDDL.New(codeKeyColumnDoesNotExits, mysql.MySQLErrName[mysql.ErrKeyColumnDoesNotExits])
 	errUnknownTypeLength        = terror.ClassDDL.New(codeUnknownTypeLength, "Unknown length for type tp %d")
 	errUnknownFractionLength    = terror.ClassDDL.New(codeUnknownFractionLength, "Unknown Length for type tp %d and fraction %d")
 	errInvalidJobVersion        = terror.ClassDDL.New(codeInvalidJobVersion, "DDL job with version %d greater than current %d")
@@ -120,6 +124,10 @@ var (
 	// errBlobCantHaveDefault forbiddens to give not null default value to TEXT/BLOB/JSON.
 	errBlobCantHaveDefault = terror.ClassDDL.New(codeBlobCantHaveDefault, mysql.MySQLErrName[mysql.ErrBlobCantHaveDefault])
 	errTooLongIndexComment = terror.ClassDDL.New(codeErrTooLongIndexComment, mysql.MySQLErrName[mysql.ErrTooLongIndexComment])
+	// ErrUnsupportedAddPartition returns for does not support add partitions.
+	ErrUnsupportedAddPartition = terror.ClassDDL.New(codeUnsupportedAddPartition, "unsupported add partitions")
+	// ErrUnsupportedCoalescePartition returns for does not support coalesce partitions.
+	ErrUnsupportedCoalescePartition = terror.ClassDDL.New(codeUnsupportedCoalescePartition, "unsupported coalesce partitions")
 
 	// ErrDupKeyName returns for duplicated key name
 	ErrDupKeyName = terror.ClassDDL.New(codeDupKeyName, "duplicate key name")
@@ -189,6 +197,10 @@ var (
 	// ErrUniqueKeyNeedAllFieldsInPf returns must include all columns in the table's partitioning function.
 	ErrUniqueKeyNeedAllFieldsInPf = terror.ClassDDL.New(codeUniqueKeyNeedAllFieldsInPf, mysql.MySQLErrName[mysql.ErrUniqueKeyNeedAllFieldsInPf])
 	errWrongExprInPartitionFunc   = terror.ClassDDL.New(codeWrongExprInPartitionFunc, mysql.MySQLErrName[mysql.ErrWrongExprInPartitionFunc])
+	// ErrWarnDataTruncated returns data truncated error.
+	ErrWarnDataTruncated = terror.ClassDDL.New(codeWarnDataTruncated, mysql.MySQLErrName[mysql.WarnDataTruncated])
+	// ErrCoalesceOnlyOnHashPartition returns coalesce partition can only be used on hash/key partitions.
+	ErrCoalesceOnlyOnHashPartition = terror.ClassDDL.New(codeCoalesceOnlyOnHashPartition, mysql.MySQLErrName[mysql.ErrCoalesceOnlyOnHashPartition])
 )
 
 // DDL is responsible for updating schema in data store and maintaining in-memory InfoSchema cache.
@@ -224,7 +236,9 @@ type DDL interface {
 	// GetTableMaxRowID gets the max row ID of a normal table or a partition.
 	GetTableMaxRowID(startTS uint64, tbl table.PhysicalTable) (int64, bool, error)
 	// SetBinlogClient sets the binlog client for DDL worker. It's exported for testing.
-	SetBinlogClient(interface{})
+	SetBinlogClient(*pumpcli.PumpsClient)
+	// GetHook gets the hook. It's exported for testing.
+	GetHook() Callback
 }
 
 // ddl is used to handle the statements that define the structure or schema of the database.
@@ -245,8 +259,8 @@ type ddlCtx struct {
 	schemaSyncer SchemaSyncer
 	ddlJobDoneCh chan struct{}
 	ddlEventCh   chan<- *util.Event
-	lease        time.Duration // lease is schema lease.
-	binlogCli    interface{}   // binlogCli is used for Binlog.
+	lease        time.Duration        // lease is schema lease.
+	binlogCli    *pumpcli.PumpsClient // binlogCli is used for Binlog.
 
 	// hook may be modified.
 	mu struct {
@@ -260,7 +274,7 @@ func (dc *ddlCtx) isOwner() bool {
 	isOwner := dc.ownerManager.IsOwner()
 	log.Debugf("[ddl] it's the DDL owner %v, self ID %s", isOwner, dc.uuid)
 	if isOwner {
-		metrics.DDLCounter.WithLabelValues(metrics.IsDDLOwner).Inc()
+		metrics.DDLCounter.WithLabelValues(metrics.DDLOwner + "_" + mysql.TiDBReleaseVersion).Inc()
 	}
 	return isOwner
 }
@@ -311,7 +325,7 @@ func newDDL(ctx context.Context, etcdCli *clientv3.Client, store kv.Storage,
 	var syncer SchemaSyncer
 	if etcdCli == nil {
 		// The etcdCli is nil if the store is localstore which is only used for testing.
-		// So we use mockOwnerManager and mockSchemaSyncer.
+		// So we use mockOwnerManager and MockSchemaSyncer.
 		manager = owner.NewMockManager(id, cancelFunc)
 		syncer = NewMockSchemaSyncer()
 	} else {
@@ -326,7 +340,7 @@ func newDDL(ctx context.Context, etcdCli *clientv3.Client, store kv.Storage,
 		ddlJobDoneCh: make(chan struct{}, 1),
 		ownerManager: manager,
 		schemaSyncer: syncer,
-		binlogCli:    binloginfo.GetPumpClient(),
+		binlogCli:    binloginfo.GetPumpsClient(),
 	}
 	ddlCtx.mu.hook = hook
 	ddlCtx.mu.interceptor = &BaseInterceptor{}
@@ -369,7 +383,15 @@ func (d *ddl) start(ctx context.Context, ctxPool *pools.ResourcePool) {
 		d.workers[addIdxWorker] = newWorker(addIdxWorker, d.store, ctxPool)
 		for _, worker := range d.workers {
 			worker.wg.Add(1)
-			go worker.start(d.ddlCtx)
+			w := worker
+			go tidbutil.WithRecovery(
+				func() { w.start(d.ddlCtx) },
+				func(r interface{}) {
+					if r != nil {
+						log.Errorf("[ddl-%s] ddl %s meet panic", w, d.uuid)
+						metrics.PanicCounter.WithLabelValues(metrics.LabelDDL).Inc()
+					}
+				})
 			metrics.DDLCounter.WithLabelValues(fmt.Sprintf("%s_%s", metrics.CreateDDL, worker.String())).Inc()
 
 			// When the start function is called, we will send a fake job to let worker
@@ -419,6 +441,12 @@ func (d *ddl) genGlobalID() (int64, error) {
 	var globalID int64
 	err := kv.RunInNewTxn(d.store, true, func(txn kv.Transaction) error {
 		var err error
+
+		// gofail: var mockGenGlobalIDFail bool
+		// if mockGenGlobalIDFail {
+		//	 return errors.New("gofail genGlobalID error")
+		// }
+
 		globalID, err = meta.NewMeta(txn).GenGlobalID()
 		return errors.Trace(err)
 	})
@@ -467,11 +495,6 @@ func (d *ddl) asyncNotifyWorker(jobTp model.ActionType) {
 }
 
 func (d *ddl) doDDLJob(ctx sessionctx.Context, job *model.Job) error {
-	// For every DDL, we must commit current transaction.
-	if err := ctx.NewTxn(); err != nil {
-		return errors.Trace(err)
-	}
-
 	// Get a global job ID and put the DDL job in the queue.
 	err := d.addDDLJob(ctx, job)
 	if err != nil {
@@ -533,8 +556,16 @@ func (d *ddl) callHookOnChanged(err error) error {
 }
 
 // SetBinlogClient implements DDL.SetBinlogClient interface.
-func (d *ddl) SetBinlogClient(binlogCli interface{}) {
+func (d *ddl) SetBinlogClient(binlogCli *pumpcli.PumpsClient) {
 	d.binlogCli = binlogCli
+}
+
+// GetHook implements DDL.GetHook interface.
+func (d *ddl) GetHook() Callback {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.mu.hook
 }
 
 // DDL error codes.
@@ -559,13 +590,16 @@ const (
 	codeInvalidIndexState      = 103
 	codeInvalidForeignKeyState = 104
 
-	codeCantDropColWithIndex        = 201
-	codeUnsupportedAddColumn        = 202
-	codeUnsupportedModifyColumn     = 203
-	codeUnsupportedDropPKHandle     = 204
-	codeUnsupportedCharset          = 205
-	codeUnsupportedModifyPrimaryKey = 206
-	codeUnsupportedShardRowIDBits   = 207
+	codeCantDropColWithIndex         = 201
+	codeUnsupportedAddColumn         = 202
+	codeUnsupportedModifyColumn      = 203
+	codeUnsupportedDropPKHandle      = 204
+	codeUnsupportedCharset           = 205
+	codeUnsupportedModifyPrimaryKey  = 206
+	codeUnsupportedShardRowIDBits    = 207
+	codeUnsupportedAddPartition      = 208
+	codeUnsupportedCoalescePartition = 209
+	codeUnsupportedModifyCharset     = 210
 
 	codeFileNotFound                           = 1017
 	codeErrorOnRename                          = 1025
@@ -574,7 +608,7 @@ const (
 	codeTooLongIdent                           = 1059
 	codeDupKeyName                             = 1061
 	codeTooLongKey                             = 1071
-	codeKeyColumnDoesNotExits                  = 1072
+	codeKeyColumnDoesNotExits                  = mysql.ErrKeyColumnDoesNotExits
 	codeIncorrectPrefixKey                     = 1089
 	codeCantRemoveAllFields                    = 1090
 	codeCantDropFieldOrKey                     = 1091
@@ -611,6 +645,9 @@ const (
 	codeUniqueKeyNeedAllFieldsInPf             = terror.ErrCode(mysql.ErrUniqueKeyNeedAllFieldsInPf)
 	codePrimaryCantHaveNull                    = terror.ErrCode(mysql.ErrPrimaryCantHaveNull)
 	codeWrongExprInPartitionFunc               = terror.ErrCode(mysql.ErrWrongExprInPartitionFunc)
+	codeWarnDataTruncated                      = terror.ErrCode(mysql.WarnDataTruncated)
+	codeCoalesceOnlyOnHashPartition            = terror.ErrCode(mysql.ErrCoalesceOnlyOnHashPartition)
+	codeUnknownPartition                       = terror.ErrCode(mysql.ErrUnknownPartition)
 )
 
 func init() {
@@ -658,6 +695,9 @@ func init() {
 		codeUniqueKeyNeedAllFieldsInPf:             mysql.ErrUniqueKeyNeedAllFieldsInPf,
 		codePrimaryCantHaveNull:                    mysql.ErrPrimaryCantHaveNull,
 		codeWrongExprInPartitionFunc:               mysql.ErrWrongExprInPartitionFunc,
+		codeWarnDataTruncated:                      mysql.WarnDataTruncated,
+		codeCoalesceOnlyOnHashPartition:            mysql.ErrCoalesceOnlyOnHashPartition,
+		codeUnknownPartition:                       mysql.ErrUnknownPartition,
 	}
 	terror.ErrClassToMySQLCodes[terror.ClassDDL] = ddlMySQLErrCodes
 }

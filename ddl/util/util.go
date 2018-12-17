@@ -14,16 +14,16 @@
 package util
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/sqlexec"
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 )
 
 const (

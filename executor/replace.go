@@ -14,20 +14,21 @@
 package executor
 
 import (
+	"context"
+
+	"github.com/opentracing/opentracing-go"
+	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
-	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
 )
 
 // ReplaceExec represents a replace executor.
 type ReplaceExec struct {
 	*InsertValues
 	Priority int
-	finished bool
 }
 
 // Close implements the Executor Close interface.
@@ -43,6 +44,7 @@ func (e *ReplaceExec) Open(ctx context.Context) error {
 	if e.SelectExec != nil {
 		return e.SelectExec.Open(ctx)
 	}
+	e.initEvalBuffer()
 	return nil
 }
 
@@ -143,7 +145,7 @@ func (e *ReplaceExec) removeIndexRow(r toBeCheckedRow) (bool, bool, error) {
 	return false, false, nil
 }
 
-func (e *ReplaceExec) exec(newRows [][]types.Datum) error {
+func (e *ReplaceExec) exec(ctx context.Context, newRows [][]types.Datum) error {
 	/*
 	 * MySQL uses the following algorithm for REPLACE (and LOAD DATA ... REPLACE):
 	 *  1. Try to insert the new row into the table
@@ -173,23 +175,18 @@ func (e *ReplaceExec) exec(newRows [][]types.Datum) error {
 			return errors.Trace(err)
 		}
 	}
-	e.finished = true
 	return nil
 }
 
 // Next implements the Executor Next interface.
 func (e *ReplaceExec) Next(ctx context.Context, chk *chunk.Chunk) error {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("replace.Next", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+	}
 	chk.Reset()
-	if e.finished {
-		return nil
-	}
-	cols, err := e.getColumns(e.Table.Cols())
-	if err != nil {
-		return errors.Trace(err)
-	}
-
 	if len(e.children) > 0 && e.children[0] != nil {
-		return errors.Trace(e.insertRowsFromSelect(ctx, cols, e.exec))
+		return e.insertRowsFromSelect(ctx, e.exec)
 	}
-	return errors.Trace(e.insertRows(cols, e.exec))
+	return e.insertRows(ctx, e.exec)
 }

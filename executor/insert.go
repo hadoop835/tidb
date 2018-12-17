@@ -14,16 +14,18 @@
 package executor
 
 import (
+	"context"
+
+	"github.com/opentracing/opentracing-go"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
-	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
 )
 
 // InsertExec represents an insert executor.
@@ -31,17 +33,16 @@ type InsertExec struct {
 	*InsertValues
 	OnDuplicate []*expression.Assignment
 	Priority    mysql.PriorityEnum
-	finished    bool
 }
 
-func (e *InsertExec) exec(rows [][]types.Datum) error {
+func (e *InsertExec) exec(ctx context.Context, rows [][]types.Datum) error {
 	// If tidb_batch_insert is ON and not in a transaction, we could use BatchInsert mode.
 	sessVars := e.ctx.GetSessionVars()
 	defer sessVars.CleanBuffers()
 	ignoreErr := sessVars.StmtCtx.DupKeyAsWarning
 
 	if !sessVars.LightningMode {
-		sessVars.GetWriteStmtBufs().BufStore = kv.NewBufferStore(e.ctx.Txn(), kv.TempTxnMemBufCap)
+		sessVars.GetWriteStmtBufs().BufStore = kv.NewBufferStore(e.ctx.Txn(true), kv.TempTxnMemBufCap)
 	}
 
 	// If you use the IGNORE keyword, duplicate-key error that occurs while executing the INSERT statement are ignored.
@@ -68,7 +69,6 @@ func (e *InsertExec) exec(rows [][]types.Datum) error {
 			}
 		}
 	}
-	e.finished = true
 	return nil
 }
 
@@ -128,21 +128,18 @@ func (e *InsertExec) batchUpdateDupRows(newRows [][]types.Datum) error {
 	return nil
 }
 
-// Next implements Exec Next interface.
+// Next implements the Executor Next interface.
 func (e *InsertExec) Next(ctx context.Context, chk *chunk.Chunk) error {
-	chk.Reset()
-	if e.finished {
-		return nil
-	}
-	cols, err := e.getColumns(e.Table.Cols())
-	if err != nil {
-		return errors.Trace(err)
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("insert.Next", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
 	}
 
+	chk.Reset()
 	if len(e.children) > 0 && e.children[0] != nil {
-		return errors.Trace(e.insertRowsFromSelect(ctx, cols, e.exec))
+		return e.insertRowsFromSelect(ctx, e.exec)
 	}
-	return errors.Trace(e.insertRows(cols, e.exec))
+	return e.insertRows(ctx, e.exec)
 }
 
 // Close implements the Executor Close interface.
@@ -154,11 +151,12 @@ func (e *InsertExec) Close() error {
 	return nil
 }
 
-// Open implements the Executor Close interface.
+// Open implements the Executor Open interface.
 func (e *InsertExec) Open(ctx context.Context) error {
 	if e.SelectExec != nil {
 		return e.SelectExec.Open(ctx)
 	}
+	e.initEvalBuffer()
 	return nil
 }
 

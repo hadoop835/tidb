@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/util/execdetails"
 	"github.com/pingcap/tidb/util/memory"
 )
@@ -60,6 +60,7 @@ type StatementContext struct {
 	UseCache               bool
 	PadCharToFullLength    bool
 	BatchCheck             bool
+	InNullRejectCheck      bool
 
 	// mu struct holds variables that change during execution.
 	mu struct {
@@ -70,14 +71,25 @@ type StatementContext struct {
 		histogramsNotLoad bool
 		execDetails       execdetails.ExecDetails
 	}
+	// PrevAffectedRows is the affected-rows value(DDL is 0, DML is the number of affected rows).
+	PrevAffectedRows int64
+	// PrevLastInsertID is the last insert ID of previous statement.
+	PrevLastInsertID uint64
+	// LastInsertID is the auto-generated ID in the current statement.
+	LastInsertID uint64
+	// InsertID is the given insert ID of an auto_increment column.
+	InsertID uint64
 
 	// Copied from SessionVars.TimeZone.
-	TimeZone     *time.Location
-	Priority     mysql.PriorityEnum
-	NotFillCache bool
-	MemTracker   *memory.Tracker
-	TableIDs     []int64
-	IndexIDs     []int64
+	TimeZone         *time.Location
+	Priority         mysql.PriorityEnum
+	NotFillCache     bool
+	MemTracker       *memory.Tracker
+	RuntimeStatsColl *execdetails.RuntimeStatsColl
+	TableIDs         []int64
+	IndexIDs         []int64
+	NowTs            time.Time
+	SysTs            time.Time
 }
 
 // AddAffectedRows adds affected rows.
@@ -237,6 +249,8 @@ func (sc *StatementContext) ResetForRetry() {
 	sc.mu.foundRows = 0
 	sc.mu.warnings = nil
 	sc.mu.Unlock()
+	sc.TableIDs = sc.TableIDs[:0]
+	sc.IndexIDs = sc.IndexIDs[:0]
 }
 
 // MergeExecDetails merges a single region execution details into self, used to print

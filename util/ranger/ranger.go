@@ -19,16 +19,16 @@ import (
 	"sort"
 	"unicode/utf8"
 
-	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/charset"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/codec"
-	"github.com/pkg/errors"
 )
 
 func validInterval(sc *stmtctx.StatementContext, low, high point) (bool, error) {
@@ -333,22 +333,6 @@ func buildCNFIndexRange(sc *stmtctx.StatementContext, cols []*expression.Column,
 		fixPrefixColRange(ranges, lengths, newTp)
 	}
 
-	if len(ranges) > 0 && len(ranges[0].LowVal) < len(cols) {
-		for _, ran := range ranges {
-			if ran.HighExclude || ran.LowExclude {
-				if ran.HighExclude {
-					ran.HighVal = append(ran.HighVal, types.NewDatum(nil))
-				} else {
-					ran.HighVal = append(ran.HighVal, types.MaxValueDatum())
-				}
-				if ran.LowExclude {
-					ran.LowVal = append(ran.LowVal, types.MaxValueDatum())
-				} else {
-					ran.LowVal = append(ran.LowVal, types.NewDatum(nil))
-				}
-			}
-		}
-	}
 	return ranges, nil
 }
 

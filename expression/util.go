@@ -19,15 +19,16 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/parser/opcode"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/opcode"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/types/parser_driver"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/hack"
-	"github.com/pkg/errors"
 )
 
 // Filter the input expressions, append the results to result.
@@ -166,7 +167,7 @@ func SubstituteCorCol2Constant(expr Expression) (Expression, error) {
 		for _, arg := range x.GetArgs() {
 			newArg, err := SubstituteCorCol2Constant(arg)
 			if err != nil {
-				return nil, errors.Trace(err)
+				return nil, err
 			}
 			_, ok := newArg.(*Constant)
 			newArgs = append(newArgs, newArg)
@@ -175,7 +176,7 @@ func SubstituteCorCol2Constant(expr Expression) (Expression, error) {
 		if allConstant {
 			val, err := x.Eval(chunk.Row{})
 			if err != nil {
-				return nil, errors.Trace(err)
+				return nil, err
 			}
 			return &Constant{Value: val, RetType: x.GetType()}, nil
 		}
@@ -207,9 +208,9 @@ func timeZone2Duration(tz string) time.Duration {
 
 	i := strings.Index(tz, ":")
 	h, err := strconv.Atoi(tz[1:i])
-	terror.Log(errors.Trace(err))
+	terror.Log(err)
 	m, err := strconv.Atoi(tz[i+1:])
-	terror.Log(errors.Trace(err))
+	terror.Log(err)
 	return time.Duration(sign) * (time.Duration(h)*time.Hour + time.Duration(m)*time.Minute)
 }
 
@@ -372,6 +373,46 @@ func extractFiltersFromDNF(ctx sessionctx.Context, dnfFunc *ScalarFunction) ([]E
 	return extractedExpr, ComposeDNFCondition(ctx, newDNFItems...)
 }
 
+// DeriveRelaxedFiltersFromDNF given a DNF expression, derive a relaxed DNF expression which only contains columns
+// in specified schema; the derived expression is a superset of original expression, i.e, any tuple satisfying
+// the original expression must satisfy the derived expression. Return nil when the derived expression is universal set.
+// A running example is: for schema of t1, `(t1.a=1 and t2.a=1) or (t1.a=2 and t2.a=2)` would be derived as
+// `t1.a=1 or t1.a=2`, while `t1.a=1 or t2.a=1` would get nil.
+func DeriveRelaxedFiltersFromDNF(expr Expression, schema *Schema) Expression {
+	sf, ok := expr.(*ScalarFunction)
+	if !ok || sf.FuncName.L != ast.LogicOr {
+		return nil
+	}
+	ctx := sf.GetCtx()
+	dnfItems := FlattenDNFConditions(sf)
+	newDNFItems := make([]Expression, 0, len(dnfItems))
+	for _, dnfItem := range dnfItems {
+		cnfItems := SplitCNFItems(dnfItem)
+		newCNFItems := make([]Expression, 0, len(cnfItems))
+		for _, cnfItem := range cnfItems {
+			if itemSF, ok := cnfItem.(*ScalarFunction); ok && itemSF.FuncName.L == ast.LogicOr {
+				relaxedCNFItem := DeriveRelaxedFiltersFromDNF(cnfItem, schema)
+				if relaxedCNFItem != nil {
+					newCNFItems = append(newCNFItems, relaxedCNFItem)
+				}
+				// If relaxed expression for embedded DNF is universal set, just drop this CNF item
+				continue
+			}
+			// This cnfItem must be simple expression now
+			// If it cannot be fully covered by schema, just drop this CNF item
+			if ExprFromSchema(cnfItem, schema) {
+				newCNFItems = append(newCNFItems, cnfItem)
+			}
+		}
+		// If this DNF item involves no column of specified schema, the relaxed expression must be universal set
+		if len(newCNFItems) == 0 {
+			return nil
+		}
+		newDNFItems = append(newDNFItems, ComposeCNFCondition(ctx, newCNFItems...))
+	}
+	return ComposeDNFCondition(ctx, newDNFItems...)
+}
+
 // GetRowLen gets the length if the func is row, returns 1 if not row.
 func GetRowLen(e Expression) int {
 	if f, ok := e.(*ScalarFunction); ok && f.FuncName.L == ast.RowFunc {
@@ -407,7 +448,7 @@ func PopRowFirstArg(ctx sessionctx.Context, e Expression) (ret Expression, err e
 			return args[1], nil
 		}
 		ret, err = NewFunction(ctx, ast.RowFunc, f.GetType(), args[1:]...)
-		return ret, errors.Trace(err)
+		return ret, err
 	}
 	return
 }
@@ -462,4 +503,87 @@ func ColumnSliceIsIntersect(s1, s2 []*Column) bool {
 		}
 	}
 	return false
+}
+
+// DatumToConstant generates a Constant expression from a Datum.
+func DatumToConstant(d types.Datum, tp byte) *Constant {
+	return &Constant{Value: d, RetType: types.NewFieldType(tp)}
+}
+
+// GetParamExpression generate a getparam function expression.
+func GetParamExpression(ctx sessionctx.Context, v *driver.ParamMarkerExpr) (Expression, error) {
+	useCache := ctx.GetSessionVars().StmtCtx.UseCache
+	tp := types.NewFieldType(mysql.TypeUnspecified)
+	types.DefaultParamTypeForValue(v.GetValue(), tp)
+	value := &Constant{Value: v.Datum, RetType: tp}
+	if useCache {
+		f, err := NewFunctionBase(ctx, ast.GetParam, &v.Type,
+			DatumToConstant(types.NewIntDatum(int64(v.Order)), mysql.TypeLonglong))
+		if err != nil {
+			return nil, err
+		}
+		f.GetType().Tp = v.Type.Tp
+		value.DeferredExpr = f
+	}
+	return value, nil
+}
+
+// DisableParseJSONFlag4Expr disables ParseToJSONFlag for `expr` except Column.
+// We should not *PARSE* a string as JSON under some scenarios. ParseToJSONFlag
+// is 0 for JSON column yet, so we can skip it. Moreover, Column.RetType refers
+// to the infoschema, if we modify it, data race may happen if another goroutine
+// read from the infoschema at the same time.
+func DisableParseJSONFlag4Expr(expr Expression) {
+	if _, isColumn := expr.(*Column); isColumn {
+		return
+	}
+	expr.GetType().Flag &= ^mysql.ParseToJSONFlag
+}
+
+// ConstructPositionExpr constructs PositionExpr with the given ParamMarkerExpr.
+func ConstructPositionExpr(p *driver.ParamMarkerExpr) *ast.PositionExpr {
+	return &ast.PositionExpr{P: p}
+}
+
+// PosFromPositionExpr generates a position value from PositionExpr.
+func PosFromPositionExpr(ctx sessionctx.Context, v *ast.PositionExpr) (int, bool, error) {
+	if v.P == nil {
+		return v.N, false, nil
+	}
+	value, err := GetParamExpression(ctx, v.P.(*driver.ParamMarkerExpr))
+	if err != nil {
+		return 0, true, err
+	}
+	pos, isNull, err := GetIntFromConstant(ctx, value)
+	if err != nil || isNull {
+		return 0, true, err
+	}
+	return pos, false, nil
+}
+
+// GetStringFromConstant gets a string value from the Constant expression.
+func GetStringFromConstant(ctx sessionctx.Context, value Expression) (string, bool, error) {
+	con, ok := value.(*Constant)
+	if !ok {
+		err := errors.Errorf("Not a Constant expression %+v", value)
+		return "", true, err
+	}
+	str, isNull, err := con.EvalString(ctx, chunk.Row{})
+	if err != nil || isNull {
+		return "", true, err
+	}
+	return str, false, nil
+}
+
+// GetIntFromConstant gets an interger value from the Constant expression.
+func GetIntFromConstant(ctx sessionctx.Context, value Expression) (int, bool, error) {
+	str, isNull, err := GetStringFromConstant(ctx, value)
+	if err != nil || isNull {
+		return 0, true, err
+	}
+	intNum, err := strconv.Atoi(str)
+	if err != nil {
+		return 0, true, nil
+	}
+	return intNum, false, nil
 }

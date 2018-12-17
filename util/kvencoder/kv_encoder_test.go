@@ -24,6 +24,7 @@ import (
 	"github.com/pingcap/tidb/store/mockstore"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/session"
@@ -34,7 +35,6 @@ import (
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/testkit"
 	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pkg/errors"
 )
 
 var _ = Suite(&testKvEncoderSuite{})
@@ -49,6 +49,7 @@ func newStoreWithBootstrap() (kv.Storage, *domain.Domain, error) {
 		return nil, nil, errors.Trace(err)
 	}
 	session.SetSchemaLease(0)
+	session.SetStatsLease(0)
 	dom, err := session.BootstrapSession(store)
 	return store, dom, errors.Trace(err)
 }
@@ -86,7 +87,7 @@ func getExpectKvPairs(tkExpect *testkit.TestKit, sql string) []KvPair {
 	tkExpect.MustExec("begin")
 	tkExpect.MustExec(sql)
 	kvPairsExpect := make([]KvPair, 0)
-	kv.WalkMemBuffer(tkExpect.Se.Txn().GetMemBuffer(), func(k kv.Key, v []byte) error {
+	kv.WalkMemBuffer(tkExpect.Se.Txn(true).GetMemBuffer(), func(k kv.Key, v []byte) error {
 		kvPairsExpect = append(kvPairsExpect, KvPair{Key: k, Val: v})
 		return nil
 	})
@@ -139,14 +140,9 @@ func (s *testKvEncoderSuite) runTestSQL(c *C, tkExpect *testkit.TestKit, encoder
 }
 
 func (s *testKvEncoderSuite) TestCustomDatabaseHandle(c *C) {
-	store, dom, err := newStoreWithBootstrap()
-	c.Assert(err, IsNil)
-	defer store.Close()
-	defer dom.Close()
-
 	dbname := "tidb"
 
-	tkExpect := testkit.NewTestKit(c, store)
+	tkExpect := testkit.NewTestKit(c, s.store)
 	tkExpect.MustExec("create database if not exists " + dbname)
 	tkExpect.MustExec("use " + dbname)
 
@@ -170,18 +166,14 @@ func (s *testKvEncoderSuite) TestCustomDatabaseHandle(c *C) {
 }
 
 func (s *testKvEncoderSuite) TestInsertPkIsHandle(c *C) {
-	store, dom, err := newStoreWithBootstrap()
-	c.Assert(err, IsNil)
-	defer store.Close()
-	defer dom.Close()
-
-	tkExpect := testkit.NewTestKit(c, store)
+	tkExpect := testkit.NewTestKit(c, s.store)
 	tkExpect.MustExec("use test")
 	var tableID int64 = 1
 	encoder, err := New("test", nil)
 	c.Assert(err, IsNil)
 	defer encoder.Close()
 
+	tkExpect.MustExec("drop table if exists t")
 	schemaSQL := "create table t(id int auto_increment, a char(10), primary key(id))"
 	tkExpect.MustExec(schemaSQL)
 	err = encoder.ExecDDLSQL(schemaSQL)
@@ -199,6 +191,7 @@ func (s *testKvEncoderSuite) TestInsertPkIsHandle(c *C) {
 
 	s.runTestSQL(c, tkExpect, encoder, sqls, tableID)
 
+	tkExpect.MustExec("drop table if exists t1")
 	schemaSQL = "create table t1(id int auto_increment, a char(10), primary key(id), key a_idx(a))"
 	tkExpect.MustExec(schemaSQL)
 	err = encoder.ExecDDLSQL(schemaSQL)
@@ -226,6 +219,7 @@ func (s *testKvEncoderSuite) TestInsertPkIsHandle(c *C) {
 		`
 
 	tableID = 3
+	tkExpect.MustExec("drop table if exists t2")
 	tkExpect.MustExec(schemaSQL)
 	err = encoder.ExecDDLSQL(schemaSQL)
 	c.Assert(err, IsNil)
@@ -249,11 +243,6 @@ func makePrepareTestCase(sql, formatSQL string, param ...interface{}) prepareTes
 }
 
 func (s *testKvEncoderSuite) TestPrepareEncode(c *C) {
-	store, dom, err := newStoreWithBootstrap()
-	c.Assert(err, IsNil)
-	defer store.Close()
-	defer dom.Close()
-
 	alloc := NewAllocator()
 	encoder, err := New("test", alloc)
 	c.Assert(err, IsNil)
@@ -298,12 +287,7 @@ func (s *testKvEncoderSuite) comparePrepareAndNormalEncode(c *C, alloc autoid.Al
 }
 
 func (s *testKvEncoderSuite) TestInsertPkIsNotHandle(c *C) {
-	store, dom, err := newStoreWithBootstrap()
-	c.Assert(err, IsNil)
-	defer store.Close()
-	defer dom.Close()
-
-	tkExpect := testkit.NewTestKit(c, store)
+	tkExpect := testkit.NewTestKit(c, s.store)
 	tkExpect.MustExec("use test")
 
 	var tableID int64 = 1
@@ -311,6 +295,7 @@ func (s *testKvEncoderSuite) TestInsertPkIsNotHandle(c *C) {
 	c.Assert(err, IsNil)
 	defer encoder.Close()
 
+	tkExpect.MustExec("drop table if exists t")
 	schemaSQL := `create table t(
 		id varchar(20),
 		a char(10),
@@ -332,12 +317,7 @@ func (s *testKvEncoderSuite) TestInsertPkIsNotHandle(c *C) {
 }
 
 func (s *testKvEncoderSuite) TestRetryWithAllocator(c *C) {
-	store, dom, err := newStoreWithBootstrap()
-	c.Assert(err, IsNil)
-	defer store.Close()
-	defer dom.Close()
-
-	tk := testkit.NewTestKit(c, store)
+	tk := testkit.NewTestKit(c, s.store)
 
 	tk.MustExec("use test")
 	alloc := NewAllocator()
@@ -346,6 +326,7 @@ func (s *testKvEncoderSuite) TestRetryWithAllocator(c *C) {
 	c.Assert(err, IsNil)
 	defer encoder.Close()
 
+	tk.MustExec("drop table if exists t")
 	schemaSQL := `create table t(
 		id int auto_increment,
 		a char(10),
@@ -387,6 +368,7 @@ func (s *testKvEncoderSuite) TestRetryWithAllocator(c *C) {
 		c.Assert(bytes.Compare(row.Val, retryKvPairs[i].Val), Equals, 0, Commentf(sql))
 	}
 
+	tk.MustExec("drop table if exists t1")
 	schemaSQL = `create table t1(
 		id int auto_increment,
 		a char(10),
@@ -423,16 +405,12 @@ func (s *testKvEncoderSuite) TestRetryWithAllocator(c *C) {
 }
 
 func (s *testKvEncoderSuite) TestAllocatorRebase(c *C) {
-	store, dom, err := newStoreWithBootstrap()
-	c.Assert(err, IsNil)
-	defer store.Close()
-	defer dom.Close()
-
-	tk := testkit.NewTestKit(c, store)
+	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	alloc := NewAllocator()
 	var tableID int64 = 1
 	encoder, err := New("test", alloc)
+	c.Assert(err, IsNil)
 	err = alloc.Rebase(tableID, 100, false)
 	c.Assert(err, IsNil)
 	defer encoder.Close()

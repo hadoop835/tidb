@@ -56,6 +56,7 @@ func RegisterMetrics() {
 	prometheus.MustRegister(BatchAddIdxHistogram)
 	prometheus.MustRegister(CampaignOwnerCounter)
 	prometheus.MustRegister(ConnGauge)
+	prometheus.MustRegister(PreparedStmtGauge)
 	prometheus.MustRegister(CriticalErrorCounter)
 	prometheus.MustRegister(DDLCounter)
 	prometheus.MustRegister(DDLWorkerHistogram)
@@ -126,4 +127,8 @@ func RegisterMetrics() {
 	prometheus.MustRegister(GCRegionTooManyLocksCounter)
 	prometheus.MustRegister(GCWorkerCounter)
 	prometheus.MustRegister(TSFutureWaitDuration)
+	prometheus.MustRegister(TotalQueryProcHistogram)
+	prometheus.MustRegister(TotalCopProcHistogram)
+	prometheus.MustRegister(TotalCopWaitHistogram)
+	prometheus.MustRegister(CPUUsagePercentageGauge)
 }

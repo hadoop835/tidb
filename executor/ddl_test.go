@@ -14,23 +14,23 @@
 package executor_test
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strings"
 	"time"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/domain"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/plan"
+	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/table"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/testkit"
-	"golang.org/x/net/context"
 )
 
 func (s *testSuite) TestTruncateTable(c *C) {
@@ -44,6 +44,23 @@ func (s *testSuite) TestTruncateTable(c *C) {
 	tk.MustExec("truncate table truncate_test")
 	result = tk.MustQuery("select * from truncate_test")
 	result.Check(nil)
+}
+
+// TestInTxnExecDDLFail tests the following case:
+//  1. Execute the SQL of "begin";
+//  2. A SQL that will fail to execute;
+//  3. Execute DDL.
+func (s *testSuite) TestInTxnExecDDLFail(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t (i int key);")
+	tk.MustExec("insert into t values (1);")
+	tk.MustExec("begin;")
+	tk.MustExec("insert into t values (1);")
+	_, err := tk.Exec("truncate table t;")
+	c.Assert(err.Error(), Equals, "[kv:1062]Duplicate entry '1' for key 'PRIMARY'")
+	result := tk.MustQuery("select count(*) from t")
+	result.Check(testkit.Rows("1"))
 }
 
 func (s *testSuite) TestCreateTable(c *C) {
@@ -125,9 +142,9 @@ func (s *testSuite) TestCreateDropDatabase(c *C) {
 	tk.MustExec("use drop_test;")
 	tk.MustExec("drop database drop_test;")
 	_, err := tk.Exec("drop table t;")
-	c.Assert(err.Error(), Equals, plan.ErrNoDB.Error())
+	c.Assert(err.Error(), Equals, plannercore.ErrNoDB.Error())
 	_, err = tk.Exec("select * from t;")
-	c.Assert(err.Error(), Equals, plan.ErrNoDB.Error())
+	c.Assert(err.Error(), Equals, plannercore.ErrNoDB.Error())
 
 	_, err = tk.Exec("drop database mysql")
 	c.Assert(err, NotNil)
@@ -214,7 +231,7 @@ func (s *testSuite) TestAlterTableModifyColumn(c *C) {
 	tk.MustExec("alter table mc modify column c2 text")
 	result := tk.MustQuery("show create table mc")
 	createSQL := result.Rows()[0][1]
-	expected := "CREATE TABLE `mc` (\n  `c1` bigint(20) DEFAULT NULL,\n  `c2` text DEFAULT NULL\n) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin"
+	expected := "CREATE TABLE `mc` (\n  `c1` bigint(20) DEFAULT NULL,\n  `c2` text DEFAULT NULL\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
 	c.Assert(createSQL, Equals, expected)
 }
 
@@ -368,7 +385,7 @@ func (s *testSuite) TestShardRowIDBits(c *C) {
 	c.Assert(err, IsNil)
 	var hasShardedID bool
 	var count int
-	c.Assert(tk.Se.NewTxn(), IsNil)
+	c.Assert(tk.Se.NewTxn(context.Background()), IsNil)
 	err = tbl.IterRecords(tk.Se, tbl.FirstKey(), nil, func(h int64, rec []types.Datum, cols []*table.Column) (more bool, err error) {
 		c.Assert(h, GreaterEqual, int64(0))
 		first8bits := h >> 56
@@ -432,4 +449,33 @@ func (s *testSuite) TestSetDDLReorgWorkerCnt(c *C) {
 	tk.MustExec("set @@global.tidb_ddl_reorg_worker_cnt = 100")
 	res = tk.MustQuery("select @@global.tidb_ddl_reorg_worker_cnt")
 	res.Check(testkit.Rows("100"))
+}
+
+func (s *testSuite) TestSetDDLReorgBatchSize(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	c.Assert(variable.GetDDLReorgBatchSize(), Equals, int32(variable.DefTiDBDDLReorgBatchSize))
+
+	tk.MustExec("set tidb_ddl_reorg_batch_size = 1")
+	tk.MustQuery("show warnings;").Check(testkit.Rows("Warning 1292 Truncated incorrect tidb_ddl_reorg_batch_size value: '1'"))
+	c.Assert(variable.GetDDLReorgBatchSize(), Equals, int32(variable.MinDDLReorgBatchSize))
+	tk.MustExec(fmt.Sprintf("set tidb_ddl_reorg_batch_size = %v", variable.MaxDDLReorgBatchSize+1))
+	tk.MustQuery("show warnings;").Check(testkit.Rows(fmt.Sprintf("Warning 1292 Truncated incorrect tidb_ddl_reorg_batch_size value: '%d'", variable.MaxDDLReorgBatchSize+1)))
+	c.Assert(variable.GetDDLReorgBatchSize(), Equals, int32(variable.MaxDDLReorgBatchSize))
+	_, err := tk.Exec("set tidb_ddl_reorg_batch_size = invalid_val")
+	c.Assert(terror.ErrorEqual(err, variable.ErrWrongTypeForVar), IsTrue, Commentf("err %v", err))
+	tk.MustExec("set tidb_ddl_reorg_batch_size = 100")
+	c.Assert(variable.GetDDLReorgBatchSize(), Equals, int32(100))
+	tk.MustExec("set tidb_ddl_reorg_batch_size = -1")
+	tk.MustQuery("show warnings;").Check(testkit.Rows("Warning 1292 Truncated incorrect tidb_ddl_reorg_batch_size value: '-1'"))
+
+	tk.MustExec("set tidb_ddl_reorg_batch_size = 100")
+	res := tk.MustQuery("select @@tidb_ddl_reorg_batch_size")
+	res.Check(testkit.Rows("100"))
+
+	res = tk.MustQuery("select @@global.tidb_ddl_reorg_batch_size")
+	res.Check(testkit.Rows(fmt.Sprintf("%v", variable.DefTiDBDDLReorgBatchSize)))
+	tk.MustExec("set @@global.tidb_ddl_reorg_batch_size = 1000")
+	res = tk.MustQuery("select @@global.tidb_ddl_reorg_batch_size")
+	res.Check(testkit.Rows("1000"))
 }

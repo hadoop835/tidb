@@ -14,6 +14,7 @@
 package ddl_test
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -21,23 +22,23 @@ import (
 	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/store/mockstore"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util/admin"
+	"github.com/pingcap/tidb/util/sqlexec"
 	"github.com/pingcap/tidb/util/testkit"
 	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 )
 
 var _ = Suite(&testStateChangeSuite{})
@@ -74,7 +75,7 @@ func (s *testStateChangeSuite) TearDownSuite(c *C) {
 	s.se.Close()
 	s.dom.Close()
 	s.store.Close()
-	testleak.AfterTest(c)()
+	testleak.AfterTest(c, ddl.TestLeakCheckCnt)()
 }
 
 // TestShowCreateTable tests the result of "show create table" when we are running "add index" or "add column".
@@ -95,9 +96,9 @@ func (s *testStateChangeSuite) TestShowCreateTable(c *C) {
 			got := result.Rows()[0][1]
 			var expected string
 			if job.Type == model.ActionAddIndex {
-				expected = "CREATE TABLE `t` (\n  `id` int(11) DEFAULT NULL,\n  KEY `idx` (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin"
+				expected = "CREATE TABLE `t` (\n  `id` int(11) DEFAULT NULL,\n  KEY `idx` (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
 			} else if job.Type == model.ActionAddColumn {
-				expected = "CREATE TABLE `t` (\n  `id` int(11) DEFAULT NULL,\n  KEY `idx` (`id`),\n  KEY `idx1` (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin"
+				expected = "CREATE TABLE `t` (\n  `id` int(11) DEFAULT NULL,\n  KEY `idx` (`id`),\n  KEY `idx1` (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
 			}
 			if got != expected {
 				checkErr = errors.Errorf("got %s, expected %s", got, expected)
@@ -229,7 +230,7 @@ func (s *testStateChangeSuite) test(c *C, tableName, alterTableSQL string, testI
 type stateCase struct {
 	session            session.Session
 	rawStmt            ast.StmtNode
-	stmt               ast.Statement
+	stmt               sqlexec.Statement
 	expectedExecErr    error
 	expectedCompileErr error
 }
@@ -296,7 +297,7 @@ func (t *testExecInfo) compileSQL(idx int) (err error) {
 		ctx := context.TODO()
 		se.PrepareTxnCtx(ctx)
 		sctx := se.(sessionctx.Context)
-		if err = executor.ResetStmtCtx(sctx, c.rawStmt); err != nil {
+		if err = executor.ResetContextOfStmt(sctx, c.rawStmt); err != nil {
 			return errors.Trace(err)
 		}
 		c.stmt, err = compiler.Compile(ctx, c.rawStmt)
@@ -347,6 +348,56 @@ type sqlWithErr struct {
 type expectQuery struct {
 	sql  string
 	rows []string
+}
+
+func (s *testStateChangeSuite) TestAppendEnum(c *C) {
+	_, err := s.se.Execute(context.Background(), `create table t (
+			c1 varchar(64),
+			c2 enum('N','Y') not null default 'N',
+			c3 timestamp on update current_timestamp,
+			c4 int primary key,
+			unique key idx2 (c2, c3))`)
+	c.Assert(err, IsNil)
+	defer s.se.Execute(context.Background(), "drop table t")
+	_, err = s.se.Execute(context.Background(), "insert into t values('a', 'N', '2017-07-01', 8)")
+	c.Assert(err, IsNil)
+	// Make sure these sqls use the the plan of index scan.
+	_, err = s.se.Execute(context.Background(), "drop stats t")
+	c.Assert(err, IsNil)
+	se, err := session.CreateSession(s.store)
+	c.Assert(err, IsNil)
+	_, err = se.Execute(context.Background(), "use test_db_state")
+	c.Assert(err, IsNil)
+
+	_, err = s.se.Execute(context.Background(), "insert into t values('a', 'A', '2018-09-19', 9)")
+	c.Assert(err.Error(), Equals, "[table:1366]Incorrect enum value: 'A' for column 'c2' at row 1")
+	failAlterTableSQL1 := "alter table t change c2 c2 enum('N') DEFAULT 'N'"
+	_, err = s.se.Execute(context.Background(), failAlterTableSQL1)
+	c.Assert(err.Error(), Equals, "[ddl:203]unsupported modify column the number of enum column's elements is less than the original: 2")
+	failAlterTableSQL2 := "alter table t change c2 c2 int default 0"
+	_, err = s.se.Execute(context.Background(), failAlterTableSQL2)
+	c.Assert(err.Error(), Equals, "[ddl:210]unsupported modify charset from utf8mb4 to binary")
+	alterTableSQL := "alter table t change c2 c2 enum('N','Y','A') DEFAULT 'A'"
+	_, err = s.se.Execute(context.Background(), alterTableSQL)
+	c.Assert(err, IsNil)
+	_, err = se.Execute(context.Background(), "insert into t values('a', 'A', '2018-09-20', 10)")
+	c.Assert(err, IsNil)
+	_, err = se.Execute(context.Background(), "insert into t (c1, c3, c4) values('a', '2018-09-21', 11)")
+	c.Assert(err, IsNil)
+
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test_db_state")
+	result, err := s.execQuery(tk, "select c4, c2 from t order by c4 asc")
+	c.Assert(err, IsNil)
+	expected := []string{"8 N", "10 A", "11 A"}
+	checkResult(result, testkit.Rows(expected...))
+
+	_, err = s.se.Execute(context.Background(), "update t set c2='N' where c4 = 10")
+	c.Assert(err, IsNil)
+	result, err = s.execQuery(tk, "select c2 from t where c4 = 10")
+	c.Assert(err, IsNil)
+	expected = []string{"8 N", "10 N", "11 A"}
+	checkResult(result, testkit.Rows(expected...))
 }
 
 // https://github.com/pingcap/tidb/pull/6249 fixes the following two test cases.
@@ -516,7 +567,6 @@ func (s *testStateChangeSuite) TestShowIndex(c *C) {
 	callback = &ddl.TestDDLCallback{}
 	d.(ddl.DDLForTest).SetHook(callback)
 
-	_, err = s.se.Execute(context.Background(), "set @@tidb_enable_table_partition = 1")
 	c.Assert(err, IsNil)
 
 	_, err = s.se.Execute(context.Background(), `create table tr(
@@ -537,7 +587,8 @@ func (s *testStateChangeSuite) TestShowIndex(c *C) {
 	c.Assert(err, IsNil)
 	result, err = s.execQuery(tk, "show index from tr;")
 	c.Assert(err, IsNil)
-	err = checkResult(result, testkit.Rows("tr 1 idx1 1 purchased A 0 <nil> <nil>  BTREE  ", "t 1 c2 1 c2 A 0 <nil> <nil> YES BTREE  "))
+	err = checkResult(result, testkit.Rows("tr 1 idx1 1 purchased A 0 <nil> <nil> YES BTREE  "))
+	c.Assert(err, IsNil)
 }
 
 func (s *testStateChangeSuite) TestParallelAlterModifyColumn(c *C) {
@@ -550,6 +601,20 @@ func (s *testStateChangeSuite) TestParallelAlterModifyColumn(c *C) {
 	}
 	s.testControlParallelExecSQL(c, sql, sql, f)
 }
+
+// TODO: This test is not a test that performs two DDLs in parallel.
+// So we should not use the function of testControlParallelExecSQL. We will handle this test in the next PR.
+// func (s *testStateChangeSuite) TestParallelColumnModifyingDefinition(c *C) {
+// 	sql1 := "insert into t(b) values (null);"
+// 	sql2 := "alter table t change b b2 bigint not null;"
+// 	f := func(c *C, err1, err2 error) {
+// 		c.Assert(err1, IsNil)
+// 		if err2 != nil {
+// 			c.Assert(err2.Error(), Equals, "[ddl:1265]Data truncated for column 'b2' at row 1")
+// 		}
+// 	}
+// 	s.testControlParallelExecSQL(c, sql1, sql2, f)
+// }
 
 func (s *testStateChangeSuite) TestParallelChangeColumnName(c *C) {
 	sql1 := "ALTER TABLE t CHANGE a aa int;"
@@ -647,16 +712,33 @@ func (s *testStateChangeSuite) testControlParallelExecSQL(c *C, sql1, sql2 strin
 	c.Assert(err, IsNil)
 	wg.Add(2)
 	ch := make(chan struct{})
+	// Make sure the sql1 is put into the DDLJobQueue.
+	go func() {
+		var qLen int
+		for {
+			kv.RunInNewTxn(s.store, false, func(txn kv.Transaction) error {
+				jobs, err3 := admin.GetDDLJobs(txn)
+				if err3 != nil {
+					return err3
+				}
+				qLen = len(jobs)
+				return nil
+			})
+			if qLen == 1 {
+				// Make sure sql2 is executed after the sql1.
+				close(ch)
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
 	go func() {
 		defer wg.Done()
-		close(ch)
 		_, err1 = se.Execute(context.Background(), sql1)
 	}()
 	go func() {
 		defer wg.Done()
 		<-ch
-		// Make sure sql2 is executed after the sql1.
-		time.Sleep(time.Millisecond * 10)
 		_, err2 = se1.Execute(context.Background(), sql2)
 	}()
 
@@ -669,12 +751,14 @@ func (s *testStateChangeSuite) testControlParallelExecSQL(c *C, sql1, sql2 strin
 
 func (s *testStateChangeSuite) testParallelExecSQL(c *C, sql string) {
 	se, err := session.CreateSession(s.store)
+	c.Assert(err, IsNil)
 	_, err = se.Execute(context.Background(), "use test_db_state")
 	c.Assert(err, IsNil)
 
 	se1, err1 := session.CreateSession(s.store)
-	_, err = se1.Execute(context.Background(), "use test_db_state")
 	c.Assert(err1, IsNil)
+	_, err = se1.Execute(context.Background(), "use test_db_state")
+	c.Assert(err, IsNil)
 
 	var err2, err3 error
 	wg := sync.WaitGroup{}

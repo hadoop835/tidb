@@ -17,13 +17,13 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/meta/autoid"
-	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/perfschema"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/table/tables"
-	"github.com/pkg/errors"
 )
 
 // Builder builds a new InfoSchema.
@@ -33,7 +33,7 @@ type Builder struct {
 }
 
 // ApplyDiff applies SchemaDiff to the new InfoSchema.
-// Return the detal updated table IDs that are produced from SchemaDiff and an error.
+// Return the detail updated table IDs that are produced from SchemaDiff and an error.
 func (b *Builder) ApplyDiff(m *meta.Meta, diff *model.SchemaDiff) ([]int64, error) {
 	b.is.schemaMetaVersion = diff.Version
 	if diff.Type == model.ActionCreateSchema {

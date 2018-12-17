@@ -14,19 +14,19 @@
 package ddl
 
 import (
+	"context"
 	"time"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testleak"
-	"golang.org/x/net/context"
 )
 
 var _ = Suite(&testSchemaSuite{})
@@ -38,7 +38,7 @@ func (s *testSchemaSuite) SetUpSuite(c *C) {
 }
 
 func (s *testSchemaSuite) TearDownSuite(c *C) {
-	testleak.AfterTest(c)()
+	testleak.AfterTest(c, TestLeakCheckCnt)()
 }
 
 func testSchemaInfo(c *C, d *ddl, name string) *model.DBInfo {

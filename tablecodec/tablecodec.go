@@ -19,13 +19,13 @@ import (
 	"math"
 	"time"
 
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
-	"github.com/pkg/errors"
 )
 
 var (
@@ -305,10 +305,10 @@ func DecodeRowWithMap(b []byte, cols map[int64]*types.FieldType, loc *time.Locat
 		row = make(map[int64]types.Datum, len(cols))
 	}
 	if b == nil {
-		return nil, nil
+		return row, nil
 	}
 	if len(b) == 1 && b[0] == codec.NilFlag {
-		return nil, nil
+		return row, nil
 	}
 	cnt := 0
 	var (
